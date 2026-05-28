@@ -1249,76 +1249,70 @@ iPhone syncs → RequestMapper::comicUpdated(libraryId, comicId)
 **Data flow for Stump → YACReader (Phase 3):**
 
 ```
-Stump progress changes (polling or WebSocket event)
+Periodic timer fires (configurable sync_interval_secs)
   → Tokio task: query Stump GraphQL for updated progress
-    → compare with last-known YACReader state in mapping DB
-      → if Stump is ahead: call C++ callback on_stump_progress_update()
-        → QMetaObject::invokeMethod(Qt::QueuedConnection)
-          → Qt thread: DBHelper::updateComicProgress() writes to .ydb
+    → compare with YACReader state (read from .ydb via rusqlite)
+      → compute bidirectional deltas (max page wins, OR completion)
+        → if Stump is ahead: write directly to .ydb via rusqlite (read-write)
+          UPDATE comic_info SET currentPage=?, read=?, hasBeenOpened=?, lastTimeOpened=?
+        → if YACReader is ahead: push to Stump via GraphQL mutation
 ```
+
+> **Note:** The original plan called for C++ callbacks (`extern "C++"` + `QMetaObject::invokeMethod`).
+> The actual implementation uses direct rusqlite writes from Rust, which is simpler and keeps
+> `cargo test` working without a C++ toolchain.
 
 ### 9.3 FFI Boundary Design
 
-The FFI boundary uses the `cxx` crate for type-safe bidirectional communication. The bridge definition is intentionally minimal — only types and functions that must cross the Rust/C++ boundary are declared here. All internal logic stays in pure Rust.
+The FFI boundary uses the `cxx` crate for type-safe communication. The bridge is **one-directional** (C++ calls Rust) — Stump→YACReader writes are done directly via rusqlite, so no `extern "C++"` block is needed. The bridge is gated behind the `ffi` Cargo feature so `cargo test` works without a C++ toolchain.
 
 ```rust
-// stump_sync/src/lib.rs
+// stump_sync/src/lib.rs (as implemented)
 
+#[cfg(feature = "ffi")]
 #[cxx::bridge(namespace = "stump_sync")]
 mod ffi {
-    // Shared types — visible to both Rust and C++
     struct SyncConfig {
         stump_url: String,
         api_key: String,
         user_id: String,
-        sync_interval_secs: u32,
         mapping_db_path: String,
-        ydb_paths: Vec<String>,       // paths to YACReader .ydb files
-        library_roots: Vec<String>,   // corresponding filesystem roots
-    }
-
-    struct ProgressUpdate {
-        comic_info_id: i64,
-        stump_media_id: String,
-        current_page: i32,
-        is_read: bool,
-        last_opened: i64,            // epoch seconds
+        sync_interval_secs: u32,       // 0 = no periodic polling
+        ydb_paths: Vec<String>,
+        library_roots: Vec<String>,
+        stump_library_ids: Vec<String>,
+        stump_library_paths: Vec<String>,
     }
 
     struct SyncResult {
         success: bool,
-        error_message: String,        // empty if success (no Option<T> in cxx)
+        error_message: String,
     }
 
     struct SyncStatus {
         is_running: bool,
-        last_sync_epoch: i64,         // 0 if never synced
-        pending_updates: u32,
-        error_message: String,        // empty if no error
+        last_error: String,
+        synced_count: u32,
     }
 
-    // Rust functions exposed to C++
     extern "Rust" {
         fn rust_sync_init(config: &SyncConfig) -> SyncResult;
-        fn rust_sync_push_progress(library_id: i64, comic_id: i64);
-        fn rust_sync_push_all();
-        fn rust_sync_pull_all();
+        fn rust_sync_push_progress(library_id: i64, comic_id: i64) -> SyncResult;
+        fn rust_sync_push_all() -> SyncResult;
+        fn rust_sync_pull_all() -> SyncResult;
+        fn rust_sync_sync_all() -> SyncResult;
         fn rust_sync_shutdown() -> SyncResult;
         fn rust_sync_status() -> SyncStatus;
     }
 
-    // C++ functions that Rust can call (callbacks)
-    unsafe extern "C++" {
-        include!("stump_sync_callbacks.h");
-
-        fn on_stump_progress_update(
-            comic_info_id: i64,
-            page: i32,
-            is_read: bool,
-            last_opened: i64,
-        );
-    }
+    // No extern "C++" block — Stump→YACReader writes use direct rusqlite access
 }
+```
+
+> **Design note:** The original plan included an `unsafe extern "C++"` block with
+> `on_stump_progress_update()` callback + `QMetaObject::invokeMethod(Qt::QueuedConnection)`
+> for thread-safe writes. This was replaced with direct rusqlite writes from Rust, which
+> is simpler, avoids thread marshaling, and keeps the crate testable standalone.
 ```
 
 **Type mapping notes:**
@@ -1333,86 +1327,71 @@ mod ffi {
 
 ### 9.4 Tokio Runtime Integration
 
-The Rust module runs a Tokio multi-threaded runtime alongside Qt's event loop. The runtime is initialized once via `OnceLock` and communicates with the FFI bridge through an `mpsc` channel.
+The Rust module runs a Tokio multi-threaded runtime alongside Qt's event loop. A `SyncRuntime` struct manages the runtime, mpsc command channel, and shared status.
 
 ```rust
-// stump_sync/src/lib.rs (runtime management)
+// stump_sync/src/runtime.rs (as implemented)
 
-use std::sync::OnceLock;
-use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
-
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-static CMD_TX: OnceLock<mpsc::UnboundedSender<SyncCommand>> = OnceLock::new();
-
-enum SyncCommand {
+pub enum SyncCommand {
     PushProgress { library_id: i64, comic_id: i64 },
     PushAll,
     PullAll,
-    FullSync,
-    Shutdown(tokio::sync::oneshot::Sender<()>),
+    SyncAll,
+    Shutdown,
 }
 
-fn rust_sync_init(config: &ffi::SyncConfig) -> ffi::SyncResult {
-    let rt = RUNTIME.get_or_init(|| {
-        Runtime::new().expect("failed to create tokio runtime")
-    });
-
-    let (tx, rx) = mpsc::unbounded_channel::<SyncCommand>();
-    CMD_TX.set(tx).expect("rust_sync_init called twice");
-
-    let config = config.clone().into(); // convert to internal Config type
-
-    rt.spawn(async move {
-        sync_engine::run(rx, config).await;
-    });
-
-    ffi::SyncResult { success: true, error_message: String::new() }
-}
-
-fn rust_sync_push_progress(library_id: i64, comic_id: i64) {
-    if let Some(tx) = CMD_TX.get() {
-        let _ = tx.send(SyncCommand::PushProgress { library_id, comic_id });
-    }
-}
-
-fn rust_sync_push_all() {
-    if let Some(tx) = CMD_TX.get() {
-        let _ = tx.send(SyncCommand::PushAll);
-    }
-}
-
-fn rust_sync_pull_all() {
-    if let Some(tx) = CMD_TX.get() {
-        let _ = tx.send(SyncCommand::PullAll);
-    }
-}
-
-fn rust_sync_shutdown() -> ffi::SyncResult {
-    if let Some(tx) = CMD_TX.get() {
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let _ = tx.send(SyncCommand::Shutdown(done_tx));
-
-        if let Some(rt) = RUNTIME.get() {
-            // Block briefly to allow graceful shutdown (max 5 seconds)
-            let _ = rt.block_on(async {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    done_rx,
-                ).await
-            });
-        }
-    }
-    ffi::SyncResult { success: true, error_message: String::new() }
+pub struct SyncRuntime {
+    tx: mpsc::UnboundedSender<SyncCommand>,
+    runtime: Option<tokio::runtime::Runtime>,
+    status: Arc<Mutex<SyncStatusInfo>>,
 }
 ```
 
+The event loop uses `tokio::select!` with a periodic timer for automatic bidirectional sync:
+
+```rust
+async fn event_loop(
+    mut rx: mpsc::UnboundedReceiver<SyncCommand>,
+    engine: SyncEngine,
+    status: Arc<Mutex<SyncStatusInfo>>,
+    poll_interval_secs: u64,
+) {
+    let mut poll_timer = if poll_interval_secs > 0 {
+        Some(tokio::time::interval(Duration::from_secs(poll_interval_secs)))
+    } else {
+        None
+    };
+    if let Some(ref mut timer) = poll_timer {
+        timer.tick().await; // skip immediate first tick
+    }
+
+    loop {
+        tokio::select! {
+            cmd = rx.recv() => {
+                match cmd {
+                    Some(SyncCommand::PushProgress { library_id, comic_id }) => { ... }
+                    Some(SyncCommand::PushAll) => { ... }
+                    Some(SyncCommand::PullAll) => { engine.pull_all().await; }
+                    Some(SyncCommand::SyncAll) => { engine.sync_all().await; }
+                    Some(SyncCommand::Shutdown) | None => break,
+                }
+            }
+            _ = poll_timer_tick(&mut poll_timer) => {
+                engine.sync_all().await; // periodic bidirectional sync
+            }
+        }
+    }
+}
+```
+
+The FFI entry points in `lib.rs` hold a `static RUNTIME: Mutex<Option<SyncRuntime>>` and delegate all commands through `runtime.send(cmd)`.
+
 **Thread safety guarantees:**
 
-- `OnceLock` ensures the runtime and channel sender are initialized exactly once.
-- `mpsc::UnboundedSender` is `Send + Sync` — safe to call from the Qt main thread.
-- `send()` is non-blocking — returns immediately, never stalls the Qt event loop.
-- The Tokio runtime's thread pool is independent of Qt threads.
+- `Mutex<Option<SyncRuntime>>` ensures safe access from the Qt main thread.
+- `mpsc::UnboundedSender::send()` is non-blocking — never stalls the Qt event loop.
+- The Tokio runtime's thread pool (2 workers) is independent of Qt threads.
+- Shutdown sends `Shutdown` command then calls `rt.shutdown_timeout(10s)`.
 
 ### 9.5 Qt Signal Integration
 
@@ -1475,29 +1454,34 @@ QObject::connect(
 stump_sync::rust_sync_shutdown();
 ```
 
-**Callback from Rust → C++ (Stump → YACReader direction):**
+**Stump → YACReader direction (direct Rust writes, no C++ callback needed):**
 
-```cpp
-// stump_sync_callbacks.h — C++ function callable from Rust
+The original plan called for a C++ callback (`stump_sync_callbacks.h` with `QMetaObject::invokeMethod`). The actual implementation writes directly to the `.ydb` SQLite file from Rust using rusqlite in read-write mode:
 
-#include <QMetaObject>
-#include <QCoreApplication>
+```rust
+// stump_sync/src/sync_engine.rs (as implemented)
 
-// Called from a Tokio worker thread — must marshal to Qt thread
-void on_stump_progress_update(
-    int64_t comic_info_id, int32_t page,
-    bool is_read, int64_t last_opened
-) {
-    QMetaObject::invokeMethod(
-        QCoreApplication::instance(),
-        [=]() {
-            // Now on the Qt main thread — safe to use DBHelper
-            DBHelper::updateComicProgress(comic_info_id, page, is_read, last_opened);
-        },
-        Qt::QueuedConnection
-    );
+pub fn write_yac_progress(
+    ydb_path: &str,
+    comic_info_id: i64,
+    page: i32,
+    num_pages: i32,
+    read: bool,
+    last_time_opened: Option<i64>,
+) -> Result<(), SyncError> {
+    let conn = Connection::open_with_flags(ydb_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let has_been_opened = if page > 1 { 1 } else { 0 };
+    let read_val = if read || page >= num_pages { 1 } else { 0 };
+    let timestamp = last_time_opened.unwrap_or_else(|| chrono::Utc::now().timestamp());
+    conn.execute(
+        "UPDATE comic_info SET currentPage=?1, read=?2, hasBeenOpened=?3, lastTimeOpened=?4 WHERE id=?5",
+        rusqlite::params![page, read_val, has_been_opened, timestamp, comic_info_id],
+    )?;
+    Ok(())
 }
 ```
+
+This is safe because YACReader's DBHelper uses per-thread SQLite connections with no global lock — concurrent writes from Rust are handled by SQLite's built-in file locking.
 
 ### 9.6 CMake Integration
 
@@ -1906,13 +1890,14 @@ stump_sync/
 │   ├── mapping_db.rs        — Mutex-wrapped rusqlite ID mapping database
 │   ├── runtime.rs           — Tokio runtime management + mpsc command channel
 │   ├── config.rs            — Configuration types (Config, LibraryConfig)
-│   ├── types.rs             — Internal data types (ComicProgress, StumpMedia, SyncDelta, SyncError)
+│   ├── types.rs             — Internal data types (ComicProgress, StumpMedia, SyncDelta, BidirectionalDelta, SyncDirection, SyncError)
 │   └── schema.sql           — Mapping DB schema (included via include_str!)
 └── tests/
     ├── common/
-    │   └── mod.rs            — Test fixtures (temp .ydb creation, mock Stump server)
+    │   └── mod.rs            — Test fixtures (temp .ydb creation, mock Stump server, read-back helpers)
     ├── test_mapping.rs       — Integration tests for mapping DB lifecycle
-    └── test_sync_flow.rs     — E2E tests: full sync flow with wiremock mock server
+    ├── test_sync_flow.rs     — E2E tests: one-way sync flow with wiremock mock server
+    └── test_bidirectional.rs — E2E tests: two-way sync (pull, mixed, conflict, completion)
 ```
 
 **`Cargo.toml`** (as implemented):
