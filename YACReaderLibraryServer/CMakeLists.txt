@@ -59,6 +59,18 @@ target_link_libraries(YACReaderLibraryServer PRIVATE
     QrCode
 )
 
+# Stump reading progress sync (Rust crate via cxx)
+if(ENABLE_STUMP_SYNC)
+    target_link_libraries(YACReaderLibraryServer PRIVATE stump-sync)
+    target_compile_definitions(YACReaderLibraryServer PRIVATE ENABLE_STUMP_SYNC)
+    if(APPLE)
+        target_link_libraries(YACReaderLibraryServer PRIVATE
+            "-framework Security" "-framework CoreFoundation" "-framework SystemConfiguration")
+    elseif(UNIX)
+        target_link_libraries(YACReaderLibraryServer PRIVATE pthread dl m)
+    endif()
+endif()
+
 # Copy server web files to build output for development (Linux uses DATADIR at runtime)
 if(WIN32 OR APPLE)
     add_custom_command(TARGET YACReaderLibraryServer POST_BUILD

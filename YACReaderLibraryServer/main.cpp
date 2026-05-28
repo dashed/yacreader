@@ -14,6 +14,10 @@
 #include "yacreader_libraries.h"
 #include "yacreader_local_server.h"
 
+#ifdef ENABLE_STUMP_SYNC
+#include "stump-sync/src/lib.rs.h"
+#endif
+
 #include <QCommandLineParser>
 #include <QCoreApplication>
 #include <QDir>
@@ -250,11 +254,84 @@ int start(QCoreApplication &app, QCommandLineParser &parser, const QStringList &
 
     librariesUpdateCoordinator->init();
 
+#ifdef ENABLE_STUMP_SYNC
+    {
+        QSettings syncSettings(YACReader::getSettingsPath() + "/" + QCoreApplication::applicationName() + ".ini",
+                               QSettings::IniFormat);
+        syncSettings.beginGroup("StumpSync");
+
+        QString stumpUrl = syncSettings.value("serverUrl").toString();
+        QString apiKey = syncSettings.value("apiKey").toString();
+        QString userId = syncSettings.value("userId").toString();
+        QString mappingDbPath = syncSettings.value("mappingDbPath").toString();
+        uint32_t syncInterval = syncSettings.value("syncIntervalSecs", 300).toUInt();
+
+        syncSettings.endGroup();
+
+        if (!stumpUrl.isEmpty() && !apiKey.isEmpty()) {
+            stump_sync::SyncConfig syncConfig;
+
+            QByteArray urlUtf8 = stumpUrl.toUtf8();
+            QByteArray keyUtf8 = apiKey.toUtf8();
+            QByteArray userUtf8 = userId.toUtf8();
+            QByteArray dbPathUtf8 = mappingDbPath.toUtf8();
+
+            syncConfig.stump_url = rust::String(urlUtf8.constData(), urlUtf8.size());
+            syncConfig.api_key = rust::String(keyUtf8.constData(), keyUtf8.size());
+            syncConfig.user_id = rust::String(userUtf8.constData(), userUtf8.size());
+            syncConfig.sync_interval_secs = syncInterval;
+            syncConfig.mapping_db_path = rust::String(dbPathUtf8.constData(), dbPathUtf8.size());
+
+            auto libs = DBHelper::getLibraries().getLibraries();
+            for (const auto &lib : libs) {
+                QString ydbPath = lib.getPath() + "/.yacreaderlibrary/library.ydb";
+                QByteArray ydbUtf8 = ydbPath.toUtf8();
+                QByteArray rootUtf8 = lib.getPath().toUtf8();
+                syncConfig.ydb_paths.push_back(rust::String(ydbUtf8.constData(), ydbUtf8.size()));
+                syncConfig.library_roots.push_back(rust::String(rootUtf8.constData(), rootUtf8.size()));
+            }
+
+            auto result = stump_sync::rust_sync_init(syncConfig);
+            if (result.success) {
+                QLOG_INFO() << "Stump sync initialized successfully";
+
+                QObject::connect(httpServer, &YACReaderHttpServer::comicUpdated,
+                                 [](qulonglong libraryId, qulonglong comicId) {
+                                     stump_sync::rust_sync_push_progress(
+                                             static_cast<int64_t>(libraryId),
+                                             static_cast<int64_t>(comicId));
+                                 });
+
+                QObject::connect(httpServer, &YACReaderHttpServer::clientSync,
+                                 []() {
+                                     stump_sync::rust_sync_push_all();
+                                 });
+            } else {
+                QLOG_ERROR() << "Stump sync init failed:"
+                             << QString::fromUtf8(result.error_message.data(),
+                                                  static_cast<int>(result.error_message.size()));
+            }
+        } else {
+            QLOG_INFO() << "Stump sync not configured (set StumpSync/serverUrl and StumpSync/apiKey)";
+        }
+    }
+#endif
+
     int ret = app.exec();
 
     QLOG_INFO() << "YACReaderLibrary closed with exit code :" << ret;
 
     // shutdown
+#ifdef ENABLE_STUMP_SYNC
+    {
+        auto result = stump_sync::rust_sync_shutdown();
+        if (!result.success) {
+            QLOG_WARN() << "Stump sync shutdown error:"
+                         << QString::fromUtf8(result.error_message.data(),
+                                              static_cast<int>(result.error_message.size()));
+        }
+    }
+#endif
     httpServer->stop();
     delete httpServer;
     localServer->close();

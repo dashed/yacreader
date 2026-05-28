@@ -68,3 +68,4 @@ c_x86_64.pch
 
 # Claude Code
 .claude/
+stump_sync/target/

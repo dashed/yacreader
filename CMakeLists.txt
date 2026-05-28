@@ -46,6 +46,7 @@ include(cmake/CompilerOptions.cmake)
 # Build configuration
 option(BUILD_TESTS "Build tests" ON)
 option(BUILD_SERVER_STANDALONE "Server standalone install (Linux only)" OFF)
+option(ENABLE_STUMP_SYNC "Enable Stump reading progress sync (requires Rust toolchain)" OFF)
 
 # Build number (set by CI)
 set(BUILD_NUMBER "" CACHE STRING "CI build number")
@@ -149,6 +150,18 @@ else()
 endif()
 qt_standard_project_setup()
 
+# Stump sync Rust crate (via Corrosion)
+if(ENABLE_STUMP_SYNC)
+    include(FetchContent)
+    FetchContent_Declare(
+        Corrosion
+        GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+        GIT_TAG v0.5.1
+    )
+    FetchContent_MakeAvailable(Corrosion)
+    corrosion_import_crate(MANIFEST_PATH ${CMAKE_SOURCE_DIR}/stump_sync/Cargo.toml FEATURES ffi)
+endif()
+
 # PDF backend detection (creates pdf_backend_iface INTERFACE target)
 include(PdfBackend)
 
@@ -204,6 +217,7 @@ message(STATUS "  Decompression backend: ${DECOMPRESSION_BACKEND}")
 message(STATUS "  PDF backend:           ${PDF_BACKEND}")
 message(STATUS "  Build tests:           ${BUILD_TESTS}")
 message(STATUS "  Server standalone:     ${BUILD_SERVER_STANDALONE}")
+message(STATUS "  Stump sync:           ${ENABLE_STUMP_SYNC}")
 message(STATUS "  Build type:            ${_build_type_summary}")
 if(BUILD_NUMBER)
     message(STATUS "  Build number:          ${BUILD_NUMBER}")
