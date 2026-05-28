@@ -1,6 +1,27 @@
 use serde::Deserialize;
 use std::fmt;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SyncDirection {
+    PushToStump,
+    PullToYac,
+    NoChange,
+}
+
+#[derive(Debug, Clone)]
+pub struct BidirectionalDelta {
+    pub direction: SyncDirection,
+    pub comic_info_id: i64,
+    pub stump_media_id: String,
+    pub ydb_path: String,
+    pub num_pages: i32,
+    pub push_page: Option<i32>,
+    pub push_mark_complete: bool,
+    pub pull_page: Option<i32>,
+    pub pull_read: bool,
+    pub pull_last_opened: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ComicProgress {
     pub comic_info_id: i64,
@@ -91,6 +112,8 @@ pub struct SyncReport {
     pub comics_matched: u32,
     pub pages_pushed: u32,
     pub completions_pushed: u32,
+    pub pages_pulled: u32,
+    pub completions_pulled: u32,
     pub errors: Vec<String>,
 }
 
@@ -101,6 +124,8 @@ impl SyncReport {
             comics_matched: 0,
             pages_pushed: 0,
             completions_pushed: 0,
+            pages_pulled: 0,
+            completions_pulled: 0,
             errors: Vec::new(),
         }
     }
@@ -176,6 +201,8 @@ mod tests {
         assert_eq!(report.comics_matched, 0);
         assert_eq!(report.pages_pushed, 0);
         assert_eq!(report.completions_pushed, 0);
+        assert_eq!(report.pages_pulled, 0);
+        assert_eq!(report.completions_pulled, 0);
         assert!(report.errors.is_empty());
     }
 

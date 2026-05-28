@@ -187,3 +187,49 @@ pub async fn mock_mark_complete_response(server: &MockServer) {
         .mount(server)
         .await;
 }
+
+pub struct ComicRow {
+    pub current_page: i32,
+    pub read: bool,
+    pub has_been_opened: bool,
+    pub last_time_opened: Option<i64>,
+}
+
+pub fn read_comic_from_ydb(ydb_path: &Path, comic_info_id: i64) -> ComicRow {
+    let conn = open_ydb(ydb_path);
+    conn.query_row(
+        "SELECT currentPage, read, hasBeenOpened, lastTimeOpened FROM comic_info WHERE id = ?1",
+        rusqlite::params![comic_info_id],
+        |row| {
+            Ok(ComicRow {
+                current_page: row.get::<_, Option<i32>>(0)?.unwrap_or(0),
+                read: row.get::<_, Option<i32>>(1)?.unwrap_or(0) != 0,
+                has_been_opened: row.get::<_, Option<i32>>(2)?.unwrap_or(0) != 0,
+                last_time_opened: row.get(3)?,
+            })
+        },
+    )
+    .unwrap()
+}
+
+pub fn mock_media_stump_ahead(id: &str, path: &str, stump_page: i32, total_pages: i32) -> MockMedia {
+    MockMedia {
+        id: id.to_string(),
+        name: path.rsplit('/').next().unwrap_or(path).to_string(),
+        pages: total_pages,
+        path: path.to_string(),
+        read_page: Some(stump_page),
+        is_complete: false,
+    }
+}
+
+pub fn mock_media_stump_complete(id: &str, path: &str, page: i32, total_pages: i32) -> MockMedia {
+    MockMedia {
+        id: id.to_string(),
+        name: path.rsplit('/').next().unwrap_or(path).to_string(),
+        pages: total_pages,
+        path: path.to_string(),
+        read_page: Some(page),
+        is_complete: true,
+    }
+}

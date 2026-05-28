@@ -10,6 +10,8 @@ use crate::types::SyncError;
 pub enum SyncCommand {
     PushProgress { library_id: i64, comic_id: i64 },
     PushAll,
+    PullAll,
+    SyncAll,
     Shutdown,
 }
 
@@ -45,6 +47,7 @@ impl SyncRuntime {
         )?;
 
         let mapping_db = MappingDb::open(&config.mapping_db_path)?;
+        let poll_interval_secs = config.sync_interval_secs;
         let engine = SyncEngine::new(client, mapping_db, config.libraries);
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -60,9 +63,9 @@ impl SyncRuntime {
         }));
 
         let status_clone = Arc::clone(&status);
-        runtime.spawn(event_loop(rx, engine, status_clone));
+        runtime.spawn(event_loop(rx, engine, status_clone, poll_interval_secs));
 
-        tracing::info!("stump_sync runtime initialized");
+        tracing::info!(poll_interval_secs, "stump_sync runtime initialized");
 
         Ok(Self {
             tx,
@@ -101,42 +104,115 @@ async fn event_loop(
     mut rx: mpsc::UnboundedReceiver<SyncCommand>,
     engine: SyncEngine,
     status: Arc<Mutex<SyncStatusInfo>>,
+    poll_interval_secs: u64,
 ) {
     tracing::info!("stump_sync event loop started");
 
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            SyncCommand::PushProgress {
-                library_id,
-                comic_id,
-            } => {
-                if let Err(e) = engine.push_single(library_id, comic_id).await {
-                    tracing::error!(error = %e, "push_single failed");
-                    if let Ok(mut s) = status.lock() {
-                        s.last_error = e.to_string();
+    let mut poll_timer = if poll_interval_secs > 0 {
+        Some(tokio::time::interval(std::time::Duration::from_secs(
+            poll_interval_secs,
+        )))
+    } else {
+        None
+    };
+
+    if let Some(ref mut timer) = poll_timer {
+        timer.tick().await;
+    }
+
+    loop {
+        tokio::select! {
+            cmd = rx.recv() => {
+                match cmd {
+                    Some(SyncCommand::PushProgress { library_id, comic_id }) => {
+                        if let Err(e) = engine.push_single(library_id, comic_id).await {
+                            tracing::error!(error = %e, "push_single failed");
+                            if let Ok(mut s) = status.lock() {
+                                s.last_error = e.to_string();
+                            }
+                        } else if let Ok(mut s) = status.lock() {
+                            s.synced_count += 1;
+                        }
                     }
-                } else if let Ok(mut s) = status.lock() {
-                    s.synced_count += 1;
+                    Some(SyncCommand::PushAll) => {
+                        match engine.push_all().await {
+                            Ok(report) => {
+                                if let Ok(mut s) = status.lock() {
+                                    s.synced_count += report.pages_pushed + report.completions_pushed;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "push_all failed");
+                                if let Ok(mut s) = status.lock() {
+                                    s.last_error = e.to_string();
+                                }
+                            }
+                        }
+                    }
+                    Some(SyncCommand::PullAll) => {
+                        match engine.pull_all().await {
+                            Ok(report) => {
+                                if let Ok(mut s) = status.lock() {
+                                    s.synced_count += report.pages_pulled + report.completions_pulled;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "pull_all failed");
+                                if let Ok(mut s) = status.lock() {
+                                    s.last_error = e.to_string();
+                                }
+                            }
+                        }
+                    }
+                    Some(SyncCommand::SyncAll) => {
+                        match engine.sync_all().await {
+                            Ok(report) => {
+                                if let Ok(mut s) = status.lock() {
+                                    s.synced_count += report.pages_pushed + report.pages_pulled
+                                        + report.completions_pushed + report.completions_pulled;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "sync_all failed");
+                                if let Ok(mut s) = status.lock() {
+                                    s.last_error = e.to_string();
+                                }
+                            }
+                        }
+                    }
+                    Some(SyncCommand::Shutdown) | None => {
+                        tracing::info!("stump_sync event loop shutting down");
+                        break;
+                    }
                 }
             }
-            SyncCommand::PushAll => {
-                match engine.push_all().await {
+            _ = async {
+                if let Some(ref mut timer) = poll_timer {
+                    timer.tick().await
+                } else {
+                    std::future::pending::<tokio::time::Instant>().await
+                }
+            } => {
+                tracing::info!("periodic sync triggered");
+                match engine.sync_all().await {
                     Ok(report) => {
+                        tracing::info!(
+                            pages_pushed = report.pages_pushed,
+                            pages_pulled = report.pages_pulled,
+                            "periodic sync complete"
+                        );
                         if let Ok(mut s) = status.lock() {
-                            s.synced_count += report.pages_pushed + report.completions_pushed;
+                            s.synced_count += report.pages_pushed + report.pages_pulled
+                                + report.completions_pushed + report.completions_pulled;
                         }
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "push_all failed");
+                        tracing::error!(error = %e, "periodic sync failed");
                         if let Ok(mut s) = status.lock() {
                             s.last_error = e.to_string();
                         }
                     }
                 }
-            }
-            SyncCommand::Shutdown => {
-                tracing::info!("stump_sync event loop shutting down");
-                break;
             }
         }
     }

@@ -1,9 +1,14 @@
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use rusqlite::OpenFlags;
 
 use crate::config::LibraryConfig;
 use crate::mapping_db::MappingDb;
 use crate::stump_client::StumpClient;
-use crate::types::{ComicProgress, StumpMedia, SyncDelta, SyncError, SyncReport};
+use crate::types::{
+    BidirectionalDelta, ComicProgress, StumpMedia, SyncDelta, SyncDirection, SyncError, SyncReport,
+};
 
 pub struct SyncEngine {
     client: StumpClient,
@@ -214,6 +219,205 @@ impl SyncEngine {
         Ok(count)
     }
 
+    pub async fn sync_all(&self) -> Result<SyncReport, SyncError> {
+        let mut report = SyncReport::new();
+
+        for lib_config in &self.libraries {
+            let lib_mapping_id = self.mapping_db.ensure_library_mapping(
+                &lib_config.ydb_path,
+                &lib_config.stump_library_id,
+                &lib_config.stump_library_path,
+            )?;
+
+            report.libraries_processed += 1;
+
+            if let Err(e) = self
+                .sync_library(lib_config, lib_mapping_id, &mut report, false)
+                .await
+            {
+                tracing::error!(library = %lib_config.ydb_path, error = %e, "failed to sync library");
+                report
+                    .errors
+                    .push(format!("{}: {e}", lib_config.ydb_path));
+            }
+        }
+
+        tracing::info!(
+            libraries = report.libraries_processed,
+            matched = report.comics_matched,
+            pages_pushed = report.pages_pushed,
+            pages_pulled = report.pages_pulled,
+            completions_pushed = report.completions_pushed,
+            completions_pulled = report.completions_pulled,
+            errors = report.errors.len(),
+            "sync_all complete"
+        );
+
+        Ok(report)
+    }
+
+    pub async fn pull_all(&self) -> Result<SyncReport, SyncError> {
+        let mut report = SyncReport::new();
+
+        for lib_config in &self.libraries {
+            let lib_mapping_id = self.mapping_db.ensure_library_mapping(
+                &lib_config.ydb_path,
+                &lib_config.stump_library_id,
+                &lib_config.stump_library_path,
+            )?;
+
+            report.libraries_processed += 1;
+
+            if let Err(e) = self
+                .sync_library(lib_config, lib_mapping_id, &mut report, true)
+                .await
+            {
+                tracing::error!(library = %lib_config.ydb_path, error = %e, "failed to pull library");
+                report
+                    .errors
+                    .push(format!("{}: {e}", lib_config.ydb_path));
+            }
+        }
+
+        tracing::info!(
+            libraries = report.libraries_processed,
+            matched = report.comics_matched,
+            pages_pulled = report.pages_pulled,
+            completions_pulled = report.completions_pulled,
+            errors = report.errors.len(),
+            "pull_all complete"
+        );
+
+        Ok(report)
+    }
+
+    async fn sync_library(
+        &self,
+        lib_config: &LibraryConfig,
+        lib_mapping_id: i64,
+        report: &mut SyncReport,
+        pull_only: bool,
+    ) -> Result<(), SyncError> {
+        let yac_comics = read_all_yac_comics(&lib_config.ydb_path)?;
+        let stump_media = self
+            .client
+            .get_library_media(&lib_config.stump_library_id)
+            .await?;
+
+        let matches = match_comics(&yac_comics, &stump_media, &lib_config.stump_library_path);
+        for (comic, media) in &matches {
+            self.mapping_db.insert_mapping(
+                lib_mapping_id,
+                comic.comic_info_id,
+                comic.comic_id,
+                &media.id,
+                &comic.relative_path,
+                &comic
+                    .relative_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&comic.relative_path),
+                "path",
+            )?;
+        }
+        report.comics_matched += matches.len() as u32;
+
+        let all_mappings = self.mapping_db.get_all_mappings(lib_mapping_id)?;
+        let mapping_by_comic: HashMap<i64, i64> = all_mappings
+            .iter()
+            .map(|m| (m.yac_comic_info_id, m.id))
+            .collect();
+
+        for (comic, media) in &matches {
+            let delta =
+                compute_bidirectional_delta(comic, media, &lib_config.ydb_path);
+
+            match delta.direction {
+                SyncDirection::PushToStump if !pull_only => {
+                    self.apply_push_delta(&delta, report).await;
+                }
+                SyncDirection::PullToYac => {
+                    self.apply_pull_delta(&delta, comic.current_page, report);
+                }
+                _ => {}
+            }
+
+            if let Some(&mapping_id) = mapping_by_comic.get(&comic.comic_info_id) {
+                let _ = self.mapping_db.update_sync_state(
+                    mapping_id,
+                    comic.current_page,
+                    media.current_page(),
+                    comic.read,
+                    media.is_complete(),
+                    None,
+                    None,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn apply_push_delta(&self, delta: &BidirectionalDelta, report: &mut SyncReport) {
+        if let Some(page) = delta.push_page {
+            tracing::info!(media_id = %delta.stump_media_id, page, "pushing page progress");
+            if let Err(e) = self.client.update_progress(&delta.stump_media_id, page).await {
+                tracing::warn!(media_id = %delta.stump_media_id, error = %e, "failed to push page");
+                report.errors.push(format!("{}: {e}", delta.stump_media_id));
+                return;
+            }
+            report.pages_pushed += 1;
+        }
+        if delta.push_mark_complete {
+            tracing::info!(media_id = %delta.stump_media_id, "marking complete on Stump");
+            if let Err(e) = self.client.mark_complete(&delta.stump_media_id, true).await {
+                tracing::warn!(media_id = %delta.stump_media_id, error = %e, "failed to push completion");
+                report.errors.push(format!("{}: {e}", delta.stump_media_id));
+                return;
+            }
+            report.completions_pushed += 1;
+        }
+    }
+
+    fn apply_pull_delta(
+        &self,
+        delta: &BidirectionalDelta,
+        current_yac_page: i32,
+        report: &mut SyncReport,
+    ) {
+        let page = delta.pull_page.unwrap_or(current_yac_page);
+        let has_page_change = delta.pull_page.is_some();
+        tracing::info!(
+            comic_info_id = delta.comic_info_id,
+            page,
+            read = delta.pull_read,
+            "pulling progress to YAC"
+        );
+        match write_yac_progress(
+            &delta.ydb_path,
+            delta.comic_info_id,
+            page,
+            delta.num_pages,
+            delta.pull_read,
+            delta.pull_last_opened,
+        ) {
+            Ok(()) => {
+                if has_page_change {
+                    report.pages_pulled += 1;
+                }
+                if delta.pull_read {
+                    report.completions_pulled += 1;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(comic_info_id = delta.comic_info_id, error = %e, "failed to pull progress");
+                report
+                    .errors
+                    .push(format!("yac:{}: {e}", delta.comic_info_id));
+            }
+        }
+    }
+
     async fn apply_delta(&self, delta: &SyncDelta) -> Result<(), SyncError> {
         if let Some(page) = delta.new_page {
             tracing::info!(media_id = %delta.stump_media_id, page, "pushing page progress");
@@ -326,6 +530,145 @@ pub fn compute_delta(yac: &ComicProgress, stump: &StumpMedia) -> Option<SyncDelt
         },
         should_mark_complete,
     })
+}
+
+pub fn read_all_yac_comics(ydb_path: &str) -> Result<Vec<ComicProgress>, SyncError> {
+    let conn = rusqlite::Connection::open_with_flags(ydb_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT ci.id, c.id, ci.currentPage, ci.numPages, ci.read, ci.hasBeenOpened, ci.lastTimeOpened, ci.hash, c.path, c.fileName
+         FROM comic_info ci
+         JOIN comic c ON c.comicInfoId = ci.id",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        let path: String = row.get::<_, String>(8).unwrap_or_default();
+        let filename: String = row.get::<_, String>(9).unwrap_or_default();
+        let relative_path = normalize_path(&path, &filename);
+        Ok(ComicProgress {
+            comic_info_id: row.get(0)?,
+            comic_id: row.get(1)?,
+            current_page: row.get::<_, Option<i32>>(2)?.unwrap_or(0),
+            num_pages: row.get::<_, Option<i32>>(3)?.unwrap_or(0),
+            read: row.get::<_, Option<i32>>(4)?.unwrap_or(0) != 0,
+            has_been_opened: row.get::<_, Option<i32>>(5)?.unwrap_or(0) != 0,
+            last_time_opened: row.get(6)?,
+            hash: row.get(7)?,
+            relative_path,
+        })
+    })?;
+
+    let mut comics = Vec::new();
+    for row in rows {
+        comics.push(row?);
+    }
+    Ok(comics)
+}
+
+pub fn write_yac_progress(
+    ydb_path: &str,
+    comic_info_id: i64,
+    page: i32,
+    num_pages: i32,
+    read: bool,
+    last_time_opened: Option<i64>,
+) -> Result<(), SyncError> {
+    let conn = rusqlite::Connection::open_with_flags(
+        ydb_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )?;
+
+    let has_been_opened: i32 = if page > 0 { 1 } else { 0 };
+    let is_read: i32 = if read || (num_pages > 0 && page >= num_pages) {
+        1
+    } else {
+        0
+    };
+    let timestamp = last_time_opened.unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    });
+
+    let updated = conn.execute(
+        "UPDATE comic_info SET currentPage = ?1, read = ?2, hasBeenOpened = ?3, lastTimeOpened = ?4 WHERE id = ?5",
+        rusqlite::params![page, is_read, has_been_opened, timestamp, comic_info_id],
+    )?;
+
+    if updated == 0 {
+        return Err(SyncError::Database(format!(
+            "comic_info_id {comic_info_id} not found in {ydb_path}"
+        )));
+    }
+
+    tracing::debug!(
+        comic_info_id,
+        page,
+        read = is_read,
+        "wrote progress to .ydb"
+    );
+    Ok(())
+}
+
+pub fn compute_bidirectional_delta(
+    yac: &ComicProgress,
+    stump: &StumpMedia,
+    ydb_path: &str,
+) -> BidirectionalDelta {
+    let stump_page = stump.current_page();
+    let stump_complete = stump.is_complete();
+
+    let yac_page_ahead = yac.current_page > stump_page;
+    let stump_page_ahead = stump_page > yac.current_page;
+
+    let yac_has_completion = yac.read && !stump_complete;
+    let stump_has_completion = stump_complete && !yac.read;
+
+    let mut delta = BidirectionalDelta {
+        direction: SyncDirection::NoChange,
+        comic_info_id: yac.comic_info_id,
+        stump_media_id: stump.id.clone(),
+        ydb_path: ydb_path.to_string(),
+        num_pages: yac.num_pages,
+        push_page: None,
+        push_mark_complete: false,
+        pull_page: None,
+        pull_read: false,
+        pull_last_opened: None,
+    };
+
+    if yac_page_ahead {
+        delta.direction = SyncDirection::PushToStump;
+        delta.push_page = Some(yac.current_page);
+        if yac_has_completion {
+            delta.push_mark_complete = true;
+        }
+    } else if stump_page_ahead {
+        delta.direction = SyncDirection::PullToYac;
+        delta.pull_page = Some(stump_page);
+        if stump_has_completion {
+            delta.pull_read = true;
+        }
+    } else if yac_has_completion {
+        delta.direction = SyncDirection::PushToStump;
+        delta.push_mark_complete = true;
+    } else if stump_has_completion {
+        delta.direction = SyncDirection::PullToYac;
+        delta.pull_read = true;
+        delta.pull_last_opened = stump
+            .read_progresses
+            .first()
+            .and_then(|rp| rp.completed_at.as_ref())
+            .and_then(|_| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs() as i64)
+            });
+    }
+
+    delta
 }
 
 #[cfg(test)]
@@ -516,5 +859,206 @@ mod tests {
         let delta = compute_delta(&comic, &media).unwrap();
         assert_eq!(delta.new_page, Some(5));
         assert!(!delta.should_mark_complete);
+    }
+
+    #[test]
+    fn test_compute_bidirectional_yac_ahead() {
+        let comic = make_comic(1, "test.cbz", 15, false);
+        let media = make_stump_media("sm-1", "/comics/test.cbz", 5, false);
+
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        assert_eq!(delta.direction, SyncDirection::PushToStump);
+        assert_eq!(delta.push_page, Some(15));
+        assert!(!delta.push_mark_complete);
+        assert!(delta.pull_page.is_none());
+    }
+
+    #[test]
+    fn test_compute_bidirectional_stump_ahead() {
+        let comic = make_comic(1, "test.cbz", 5, false);
+        let media = make_stump_media("sm-1", "/comics/test.cbz", 15, false);
+
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        assert_eq!(delta.direction, SyncDirection::PullToYac);
+        assert_eq!(delta.pull_page, Some(15));
+        assert!(!delta.pull_read);
+        assert!(delta.push_page.is_none());
+    }
+
+    #[test]
+    fn test_compute_bidirectional_equal() {
+        let comic = make_comic(1, "test.cbz", 10, false);
+        let media = make_stump_media("sm-1", "/comics/test.cbz", 10, false);
+
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        assert_eq!(delta.direction, SyncDirection::NoChange);
+    }
+
+    #[test]
+    fn test_compute_bidirectional_yac_complete_stump_not() {
+        let comic = make_comic(1, "test.cbz", 20, true);
+        let media = make_stump_media("sm-1", "/comics/test.cbz", 20, false);
+
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        assert_eq!(delta.direction, SyncDirection::PushToStump);
+        assert!(delta.push_mark_complete);
+        assert!(delta.push_page.is_none());
+    }
+
+    #[test]
+    fn test_compute_bidirectional_stump_complete_yac_not() {
+        let comic = make_comic(1, "test.cbz", 20, false);
+        let media = make_stump_media("sm-1", "/comics/test.cbz", 20, true);
+
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        assert_eq!(delta.direction, SyncDirection::PullToYac);
+        assert!(delta.pull_read);
+        assert!(delta.pull_page.is_none());
+    }
+
+    #[test]
+    fn test_compute_bidirectional_both_complete() {
+        let comic = make_comic(1, "test.cbz", 20, true);
+        let media = make_stump_media("sm-1", "/comics/test.cbz", 20, true);
+
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        assert_eq!(delta.direction, SyncDirection::NoChange);
+    }
+
+    #[test]
+    fn test_compute_bidirectional_yac_ahead_and_complete() {
+        let comic = make_comic(1, "test.cbz", 20, true);
+        let media = make_stump_media("sm-1", "/comics/test.cbz", 10, false);
+
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        assert_eq!(delta.direction, SyncDirection::PushToStump);
+        assert_eq!(delta.push_page, Some(20));
+        assert!(delta.push_mark_complete);
+    }
+
+    #[test]
+    fn test_compute_bidirectional_stump_ahead_and_complete() {
+        let comic = make_comic(1, "test.cbz", 5, false);
+        let media = make_stump_media("sm-1", "/comics/test.cbz", 18, true);
+
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        assert_eq!(delta.direction, SyncDirection::PullToYac);
+        assert_eq!(delta.pull_page, Some(18));
+        assert!(delta.pull_read);
+    }
+
+    #[test]
+    fn test_compute_bidirectional_page_priority_over_completion() {
+        // YAC has higher page, Stump has completion — page wins (PushToStump)
+        let comic = make_comic(1, "test.cbz", 18, false);
+        let media = make_stump_media("sm-1", "/comics/test.cbz", 10, true);
+
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        assert_eq!(delta.direction, SyncDirection::PushToStump);
+        assert_eq!(delta.push_page, Some(18));
+        assert!(!delta.push_mark_complete);
+    }
+
+    #[test]
+    fn test_write_yac_progress() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE comic_info (
+                id INTEGER PRIMARY KEY,
+                currentPage INTEGER DEFAULT 0,
+                numPages INTEGER DEFAULT 20,
+                read INTEGER DEFAULT 0,
+                hasBeenOpened INTEGER DEFAULT 0,
+                lastTimeOpened INTEGER,
+                hash TEXT
+            );
+            CREATE TABLE comic (
+                id INTEGER PRIMARY KEY,
+                comicInfoId INTEGER,
+                path TEXT,
+                fileName TEXT
+            );
+            INSERT INTO comic_info (id, currentPage, numPages, read, hasBeenOpened) VALUES (1, 0, 20, 0, 0);
+            INSERT INTO comic (id, comicInfoId, path, fileName) VALUES (1, 1, 'Marvel', 'test.cbz');",
+        )
+        .unwrap();
+        drop(conn);
+
+        write_yac_progress(path, 1, 15, 20, false, Some(1700000000)).unwrap();
+
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let (page, read, opened, ts): (i32, i32, i32, i64) = conn
+            .query_row(
+                "SELECT currentPage, read, hasBeenOpened, lastTimeOpened FROM comic_info WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(page, 15);
+        assert_eq!(read, 0);
+        assert_eq!(opened, 1);
+        assert_eq!(ts, 1700000000);
+    }
+
+    #[test]
+    fn test_write_yac_progress_auto_complete() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE comic_info (
+                id INTEGER PRIMARY KEY,
+                currentPage INTEGER DEFAULT 0,
+                numPages INTEGER DEFAULT 20,
+                read INTEGER DEFAULT 0,
+                hasBeenOpened INTEGER DEFAULT 0,
+                lastTimeOpened INTEGER,
+                hash TEXT
+            );
+            INSERT INTO comic_info (id, currentPage, numPages) VALUES (1, 0, 20);",
+        )
+        .unwrap();
+        drop(conn);
+
+        write_yac_progress(path, 1, 20, 20, false, None).unwrap();
+
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let read: i32 = conn
+            .query_row(
+                "SELECT read FROM comic_info WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(read, 1, "should auto-set read when page >= num_pages");
+    }
+
+    #[test]
+    fn test_write_yac_progress_not_found() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE comic_info (
+                id INTEGER PRIMARY KEY,
+                currentPage INTEGER DEFAULT 0,
+                numPages INTEGER DEFAULT 20,
+                read INTEGER DEFAULT 0,
+                hasBeenOpened INTEGER DEFAULT 0,
+                lastTimeOpened INTEGER,
+                hash TEXT
+            );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = write_yac_progress(path, 999, 5, 20, false, None);
+        assert!(result.is_err());
     }
 }

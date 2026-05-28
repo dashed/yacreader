@@ -4,6 +4,7 @@ pub struct Config {
     pub api_key: String,
     pub user_id: String,
     pub mapping_db_path: String,
+    pub sync_interval_secs: u64,
     pub libraries: Vec<LibraryConfig>,
 }
 

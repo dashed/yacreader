@@ -25,6 +25,7 @@ mod ffi {
         api_key: String,
         user_id: String,
         mapping_db_path: String,
+        sync_interval_secs: u64,
         ydb_paths: Vec<String>,
         library_roots: Vec<String>,
         stump_library_ids: Vec<String>,
@@ -48,6 +49,8 @@ mod ffi {
         fn rust_sync_init(config: &SyncConfig) -> SyncResult;
         fn rust_sync_push_progress(library_id: i64, comic_id: i64) -> SyncResult;
         fn rust_sync_push_all() -> SyncResult;
+        fn rust_sync_pull_all() -> SyncResult;
+        fn rust_sync_sync_all() -> SyncResult;
         fn rust_sync_shutdown() -> SyncResult;
         fn rust_sync_status() -> SyncStatus;
     }
@@ -97,6 +100,7 @@ fn rust_sync_init(config: &ffi::SyncConfig) -> ffi::SyncResult {
         api_key: config.api_key.clone(),
         user_id: config.user_id.clone(),
         mapping_db_path: config.mapping_db_path.clone(),
+        sync_interval_secs: config.sync_interval_secs,
         libraries,
     };
 
@@ -142,6 +146,38 @@ fn rust_sync_push_all() -> ffi::SyncResult {
 
     match guard.as_ref() {
         Some(rt) => match rt.send(runtime::SyncCommand::PushAll) {
+            Ok(()) => make_ok(),
+            Err(e) => make_err(e.to_string()),
+        },
+        None => make_err("sync engine not initialized".into()),
+    }
+}
+
+#[cfg(feature = "ffi")]
+fn rust_sync_pull_all() -> ffi::SyncResult {
+    let guard = match RUNTIME.lock() {
+        Ok(g) => g,
+        Err(e) => return make_err(format!("lock poisoned: {e}")),
+    };
+
+    match guard.as_ref() {
+        Some(rt) => match rt.send(runtime::SyncCommand::PullAll) {
+            Ok(()) => make_ok(),
+            Err(e) => make_err(e.to_string()),
+        },
+        None => make_err("sync engine not initialized".into()),
+    }
+}
+
+#[cfg(feature = "ffi")]
+fn rust_sync_sync_all() -> ffi::SyncResult {
+    let guard = match RUNTIME.lock() {
+        Ok(g) => g,
+        Err(e) => return make_err(format!("lock poisoned: {e}")),
+    };
+
+    match guard.as_ref() {
+        Some(rt) => match rt.send(runtime::SyncCommand::SyncAll) {
             Ok(()) => make_ok(),
             Err(e) => make_err(e.to_string()),
         },
