@@ -351,6 +351,257 @@ mutation {
 
 **Authentication**: API key, passed as a header. Created in Stump's admin UI.
 
+### 5.5 Real-Time Sync Mechanisms
+
+The polling-based sync cycle described in §5.4 introduces up to 60 seconds of latency between a reading progress change and its propagation. This section describes event-driven approaches that reduce sync latency from tens of seconds to sub-second, while retaining polling as a reliable fallback.
+
+#### 5.5.1 Polling vs Event-Driven Overview
+
+| Approach | Latency | Complexity | Reliability |
+|----------|---------|------------|-------------|
+| Polling only (§5.4) | 0–60s (configurable) | Low | Very high — no state to manage |
+| PRAGMA data_version + filesystem watch | 0–5s | Medium | High — OS-level primitives |
+| Fork: webhook from YACReaderServer | <100ms | Low (after fork) | High — HTTP POST on each event |
+| Stump WebSocket subscription | Instant | Medium | Moderate — requires reconnection logic |
+| Combined (recommended) | <5s typical, instant for Stump events | Medium–High | Very high with polling fallback |
+
+The recommended production architecture combines event-driven triggers with polling as a heartbeat. Events trigger immediate sync cycles; polling catches anything missed.
+
+#### 5.5.2 Stump: GraphQL WebSocket Subscriptions
+
+**What works today (no Stump changes):**
+
+Stump exposes a GraphQL subscription endpoint at `GET /api/graphql/ws` using the `graphql-ws` WebSocket protocol. The schema defines:
+
+```graphql
+type Subscription {
+  readEvents: CoreEvent!
+}
+```
+
+The subscription is backed by a `tokio::sync::broadcast` channel (capacity 1024) held in the `Ctx` struct. The sidecar can subscribe and receive `CoreEvent` variants in real time:
+
+| CoreEvent Variant | Trigger | Useful for Sync? |
+|-------------------|---------|------------------|
+| `JobStarted` | Scan/task begins | No — informational |
+| `JobUpdate` | Scan progress | No |
+| `JobOutput` | Task output | No |
+| `CreatedMedia` | New media indexed | Yes — trigger ID mapping rebuild |
+| `CreatedManySeries` | Bulk series creation | Yes — trigger ID mapping rebuild |
+| `CreatedOrUpdatedManyMedia` | Bulk media changes | Yes — trigger ID mapping rebuild |
+| `DiscoveredMissingLibrary` | Library path gone | No — error condition |
+
+This means the sidecar can **already** subscribe to library structure changes (new comics added, scan completions) and rebuild its ID mappings immediately rather than waiting for the next poll cycle.
+
+**The critical gap: no reading progress events.**
+
+The `updateMediaProgress` GraphQL mutation (`crates/graphql/src/mutation/media.rs:300`) writes directly to the database without emitting a `CoreEvent`. The same is true for the KoReader sync and OPDS v2.0 progression endpoints. This means reading progress changes in Stump are **invisible** to WebSocket subscribers.
+
+**Minimal Stump contribution (~20 lines of Rust):**
+
+Adding a new variant to the `CoreEvent` enum and emitting it from the three progress-update code paths would make progress changes flow through the existing broadcast → subscription pipeline automatically:
+
+```rust
+// In core/src/event.rs — add variant to CoreEvent enum
+ReadingProgressUpdated {
+    user_id: String,
+    media_id: String,
+    page: i32,
+    percentage: Option<f64>,
+    is_complete: bool,
+}
+```
+
+Emit sites (each ~3 lines):
+1. `update_media_progress` — GraphQL mutation handler
+2. KoReader sync endpoint
+3. OPDS v2.0 `PUT /books/{id}/progression`
+
+This is a small, self-contained contribution that benefits any Stump integration.
+
+**Sidecar WebSocket client:**
+
+```python
+import asyncio
+import websockets
+import json
+
+SUBSCRIPTION_QUERY = """
+subscription {
+  readEvents {
+    __typename
+    ... on CreatedMedia { id }
+    ... on CreatedOrUpdatedManyMedia { count }
+    # ReadingProgressUpdated fields (after Stump contribution)
+  }
+}
+"""
+
+async def subscribe_stump_events(url: str, on_event):
+    async for ws in websockets.connect(url, subprotocols=["graphql-transport-ws"]):
+        try:
+            await ws.send(json.dumps({"type": "connection_init"}))
+            await ws.recv()  # connection_ack
+            await ws.send(json.dumps({
+                "id": "1",
+                "type": "subscribe",
+                "payload": {"query": SUBSCRIPTION_QUERY},
+            }))
+            async for msg in ws:
+                data = json.loads(msg)
+                if data.get("type") == "next":
+                    await on_event(data["payload"]["data"]["readEvents"])
+        except websockets.ConnectionClosed:
+            continue  # Auto-reconnect via `async for`
+```
+
+#### 5.5.3 YACReader: Change Detection
+
+**Existing Qt signals (connected in GUI, unconnected in headless server):**
+
+YACReaderLibraryServer already emits Qt signals on progress updates:
+- `requestmapper.cpp:131` — `emit clientSync()` after `POST /v2/sync` batch sync
+- `requestmapper.cpp:153` — `emit comicUpdated(updatedLibraryId, updatedComicId)` after single comic update
+
+These signals are relayed from `RequestMapper` → `YACReaderHttpServer` (`yacreader_http_server.cpp:110–111`), but in the headless `YACReaderLibraryServer/main.cpp`, **they are never connected to anything**. The GUI version uses them for UI refresh.
+
+**Approach A: PRAGMA data_version (best no-fork option)**
+
+SQLite's `PRAGMA data_version` returns a counter that increments on any write to the database, even from other connections or processes. This enables efficient cross-process change detection:
+
+```python
+import sqlite3
+
+class YACReaderChangeDetector:
+    def __init__(self, ydb_path: str):
+        self.conn = sqlite3.connect(f"file:{ydb_path}?mode=ro", uri=True)
+        self.last_data_version = self._get_data_version()
+
+    def _get_data_version(self) -> int:
+        return self.conn.execute("PRAGMA data_version").fetchone()[0]
+
+    def has_changes(self) -> bool:
+        current = self._get_data_version()
+        if current != self.last_data_version:
+            self.last_data_version = current
+            return True
+        return False
+```
+
+| Property | Value |
+|----------|-------|
+| Latency | 0–5s (depends on poll interval for this PRAGMA) |
+| Overhead | Negligible — no data read, just a version counter |
+| Cross-process | Yes — detects writes from YACReaderServer's process |
+| Platform | All (SQLite built-in) |
+| Limitation | Only signals "something changed" — follow-up query needed |
+
+The follow-up query uses `lastTimeOpened` to find what changed:
+
+```sql
+SELECT ci.id, ci.currentPage, ci.read, ci.lastTimeOpened
+FROM comic_info ci
+WHERE ci.lastTimeOpened > :last_known_timestamp;
+```
+
+**Approach B: Filesystem watching**
+
+Watch the `.ydb` file for modifications using OS-level file notification APIs:
+
+| Platform | Mechanism | Latency | Notes |
+|----------|-----------|---------|-------|
+| Linux | inotify (`IN_MODIFY`) | <10ms | Kernel-level, very reliable |
+| macOS | kqueue / FSEvents | <10ms / ~500ms | kqueue for file-level; FSEvents for directory-level |
+| Cross-platform | Python `watchdog` library | Varies by backend | Abstracts platform differences |
+
+Caveats:
+- SQLite in default journal mode (`delete`) generates writes to both the main DB file and a `-journal` file. Filter events to the main `.ydb` file only.
+- Debounce rapid successive writes (SQLite may trigger multiple filesystem events per transaction).
+
+**Recommended no-fork hybrid: PRAGMA data_version + filesystem watchdog**
+
+```
+1. Open library.ydb read-only
+2. Start watchdog observer on .ydb file
+3. On filesystem event OR every 5 seconds:
+   → Check PRAGMA data_version
+   → If changed: query comic_info WHERE lastTimeOpened > last_known
+   → Trigger sync cycle for changed comics
+4. Latency: 0–5 seconds. Overhead: negligible. Reliability: very high.
+```
+
+The filesystem watcher provides near-instant notification; the PRAGMA check confirms an actual data change (filtering out journal-file noise); the 5-second polling interval catches any events the watcher might miss.
+
+**Fork options (minimal YACReaderLibraryServer changes):**
+
+| Option | Lines Changed | Latency | Implementation |
+|--------|---------------|---------|----------------|
+| **Webhook** | ~10 | <100ms | After `emit clientSync()` / `emit comicUpdated(...)`, add `QNetworkAccessManager::post()` to configurable URL |
+| **Connect signals to Unix socket** | ~3 | <50ms | In `main.cpp`, connect existing signals to `QLocalServer` |
+| **Touch sentinel file** | ~5 | <100ms | Touch `.sync_event` file after sync; sidecar watches with `watchdog` |
+| **Unix socket server** | ~15 | <50ms | Create `QLocalServer` that emits JSON events with libraryId, comicId |
+
+The webhook option is recommended for forks — it provides rich event data (library ID, comic ID) with minimal code change and works over the network.
+
+#### 5.5.4 Combined Real-Time Architecture
+
+```
+┌─────────────┐
+│  iPhone      │
+│  YACReader   │──── POST /v2/sync ────┐
+│  iOS App     │                        │
+└──────────────┘                        ▼
+                              ┌──────────────────────┐
+                              │ YACReaderLibrary-     │
+                              │ Server                │
+                              │                       │
+                              │  library.ydb ◄────────┼──── writes on sync
+                              └──────────┬────────────┘
+                                         │
+              ┌──────────────────────────┐│
+              │                          ││ filesystem events
+              │   Sync Sidecar Service   ││ + PRAGMA data_version
+              │                          │◄┘
+              │  ┌────────────────────┐  │
+              │  │ Event Listeners    │  │
+              │  │                    │  │
+              │  │ • watchdog on .ydb │  │        ┌─────────────────┐
+              │  │ • PRAGMA polling   │──┼───────►│                 │
+              │  │ • Stump WebSocket  │◄─┼────────│  Stump          │
+              │  │ • Polling fallback │  │  WS    │                 │
+              │  └────────────────────┘  │        │  GraphQL WS     │
+              │                          │        │  /api/graphql/ws│
+              │  ┌────────────────────┐  │        └─────────────────┘
+              │  │ Sync Engine        │  │
+              │  │ • match IDs        │  │
+              │  │ • resolve conflicts│  │
+              │  │ • write updates    │  │
+              │  └────────────────────┘  │
+              └──────────────────────────┘
+```
+
+**Event routing logic:**
+
+| Event Source | Triggers | Sync Direction |
+|--------------|----------|----------------|
+| Filesystem watch / PRAGMA data_version change | Immediate sync cycle | YACReader → Stump |
+| Stump WebSocket `CreatedMedia` / `CreatedOrUpdatedManyMedia` | ID mapping rebuild | — (structure only) |
+| Stump WebSocket `ReadingProgressUpdated` (after contribution) | Immediate sync cycle | Stump → YACReader |
+| Polling timer (every 60–300s) | Full sync cycle | Bidirectional |
+
+The polling fallback runs on a longer interval (60–300s) than the original design since events handle the fast path. It serves as a consistency check and catches any events lost to network interruptions or race conditions.
+
+#### 5.5.5 Latency Comparison
+
+| Approach | YAC→Stump Latency | Stump→YAC Latency | Requires Code Changes? |
+|----------|-------------------|--------------------|------------------------|
+| Polling only (§5.4) | 0–60s | 0–60s | No |
+| + PRAGMA data_version + watchdog | **0–5s** | 0–60s | No |
+| + Stump WebSocket (current events) | 0–5s | 0–60s (progress not evented) | No |
+| + Stump WebSocket (with contribution) | 0–5s | **Instant** | ~20 lines Rust in Stump |
+| + YACReader fork webhook | **<100ms** | 0–60s | ~10 lines C++/Qt in YACReader |
+| Full real-time (both contributions) | **<100ms** | **Instant** | Both forks |
+
 ---
 
 ## 6. Sidecar Service Architecture
@@ -445,6 +696,51 @@ Each sync cycle follows this sequence:
 4. **Compare**: For each matched pair, compare the sync-relevant fields. Determine which system is "ahead" using the conflict resolution rules from §5.3.
 
 5. **Write**: Batch updates to YACReader via `POST /v2/sync`. Individual updates to Stump via GraphQL mutations. Record the new sync state in the mapping DB.
+
+#### Event-Driven Flow (Real-Time Enhancement)
+
+When real-time sync is enabled (§5.5), the sidecar runs persistent event listeners alongside the polling cycle. Events trigger targeted sync operations rather than full cycles:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  EVENT-DRIVEN SYNC FLOW                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  EVENT SOURCE A: Filesystem watch + PRAGMA data_version          │
+│  (YACReader .ydb changed)                                        │
+│                                                                  │
+│    watchdog detects .ydb modification                            │
+│      → debounce 500ms                                            │
+│      → PRAGMA data_version — changed?                            │
+│        ├─ NO  → ignore (journal noise)                          │
+│        └─ YES → query changed comics (lastTimeOpened > last)    │
+│                 → match IDs (use cached mapping)                │
+│                 → write to Stump (GraphQL mutations)            │
+│                 → update sync_state                              │
+│                                                                  │
+│  EVENT SOURCE B: Stump WebSocket subscription                    │
+│  (GraphQL readEvents)                                            │
+│                                                                  │
+│    CreatedMedia / CreatedOrUpdatedManyMedia                       │
+│      → rebuild ID mappings for affected library                  │
+│                                                                  │
+│    ReadingProgressUpdated (after Stump contribution)             │
+│      → look up media_id in mapping DB                           │
+│      → compare with cached YACReader state                      │
+│      → if Stump is ahead: POST /v2/sync to YACReader           │
+│      → update sync_state                                         │
+│                                                                  │
+│  EVENT SOURCE C: Polling heartbeat (every 60–300s)               │
+│                                                                  │
+│    Full sync cycle (steps 1–5 above)                             │
+│      → catches anything missed by event sources                 │
+│      → verifies consistency of event-driven syncs               │
+│                                                                  │
+│  THROTTLE: Only one sync operation runs at a time.               │
+│  Queued events coalesce into a single follow-up cycle.           │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ### 6.4 State Management
 
@@ -573,6 +869,8 @@ volumes:
 
 **Effort**: ~2–3 days of development.
 
+**Real-time enhancement** (adds ~1 day): Add `PRAGMA data_version` polling and filesystem `watchdog` observer on the `.ydb` file (§5.5.3). This reduces YACReader → Stump sync latency from 0–60s to 0–5s without any code changes to either server. The sidecar triggers an immediate targeted sync cycle when it detects a database change, rather than waiting for the next polling interval.
+
 ### Phase 3: Two-Way Progress Sync
 
 **Goal**: Progress flows in both directions. Reading on any client updates both systems.
@@ -588,6 +886,8 @@ volumes:
 **Outcome**: Full bidirectional sync. Either system can be used for reading.
 
 **Effort**: ~2–3 additional days.
+
+**Real-time enhancement** (adds ~1 day): Add Stump WebSocket subscription for library structure events (§5.5.2). The sidecar subscribes to `readEvents` via `GET /api/graphql/ws` and rebuilds ID mappings instantly when new media is indexed. If the `ReadingProgressUpdated` event is contributed upstream (~20 lines of Rust), this also enables instant Stump → YACReader progress sync — the sidecar receives progress changes over WebSocket and immediately writes them to YACReader via `POST /v2/sync`.
 
 ### Phase 4: Embedded Sync in YACReaderLibraryServer Fork (Optional)
 
@@ -605,6 +905,8 @@ volumes:
 **Outcome**: Single-server deployment. No sidecar needed.
 
 **Effort**: ~1–2 weeks. Requires C++/Qt familiarity. Consider whether the maintenance overhead justifies eliminating a simple Python sidecar.
+
+**Alternative real-time path**: Instead of (or before) a full C++ rewrite, a minimal fork of YACReaderLibraryServer can add webhook notifications (~10 lines of C++/Qt). After `emit clientSync()` and `emit comicUpdated(...)` in `requestmapper.cpp`, add a `QNetworkAccessManager::post()` call to a configurable webhook URL. The sidecar receives HTTP POST events with library and comic IDs, enabling sub-100ms YACReader → Stump sync with rich event data. This is a much smaller fork surface than the full embedded sync approach and preserves the Python sidecar architecture.
 
 ---
 
@@ -689,6 +991,66 @@ The YACReader HTTP API has no endpoint to list all comics with their progress in
 **Impact**: Using the HTTP API alone for reading progress is inefficient — requires many requests.
 
 **Mitigation**: Read progress directly from the `.ydb` SQLite file (read-only mode). This is a single query, fast, and safe for concurrent access (SQLite supports multiple readers). Use the HTTP API only for writes.
+
+### 8.8 WebSocket Reconnection
+
+The Stump GraphQL WebSocket subscription is a long-lived connection that will inevitably drop — server restarts, network blips, Tailscale reconnects, container restarts.
+
+**Impact**: Missed events during disconnection. The sidecar believes it's listening but receives nothing.
+
+**Mitigation**:
+- **Reconnect with exponential backoff**: Start at 1s, cap at 60s. The `websockets` library's `async for` pattern handles this automatically.
+- **Full sync on reconnect**: After re-establishing the subscription, run one complete polling cycle to catch events missed during the disconnection window.
+- **Heartbeat monitoring**: The `graphql-ws` protocol supports `ping`/`pong` frames. If no pong is received within 30s, treat the connection as dead and reconnect.
+- **Connection state logging**: Log connect/disconnect events with timestamps so missed-event windows are auditable.
+
+### 8.9 Filesystem Watch Reliability
+
+Filesystem watchers (inotify, kqueue, FSEvents) have platform-specific quirks that affect reliability.
+
+**Impact**: False positives (journal file writes), missed events (buffer overflow), or platform-dependent behavior.
+
+**Mitigation**:
+- **Journal file filtering**: SQLite in default journal mode creates and deletes `library.ydb-journal` files during writes. Watch only the main `.ydb` file, not the journal.
+- **Debouncing**: A single YACReader sync operation may trigger multiple rapid filesystem events (journal create → DB write → journal delete). Debounce with a 500ms–1s window before checking `PRAGMA data_version`.
+- **inotify queue overflow** (Linux): The default `max_queued_events` (16384) is sufficient, but under extreme write load, events can be dropped. The PRAGMA polling fallback (every 5s) catches these.
+- **macOS FSEvents latency**: Directory-level FSEvents can batch with ~500ms latency. For file-level precision, use kqueue — Python's `watchdog` library selects the appropriate backend automatically.
+- **Docker/NFS considerations**: Filesystem watchers do not work reliably across Docker volume mounts backed by network filesystems (NFS, CIFS). If the `.ydb` is on a network mount, fall back to PRAGMA-only polling.
+
+### 8.10 Event Ordering and Deduplication
+
+When multiple event sources (filesystem watch, WebSocket, polling) trigger sync cycles concurrently, duplicate or out-of-order operations can occur.
+
+**Impact**: Redundant API calls, potential for stale data overwriting fresh data.
+
+**Mitigation**:
+- **Idempotent sync operations**: All write operations must be idempotent. The conflict resolution rules (§5.3) ensure that writing a "stale" value is harmless — `max(page)` and `OR(read)` converge regardless of application order.
+- **Sync cycle serialization**: Use an `asyncio.Lock` (or equivalent) to ensure only one sync cycle runs at a time. If an event arrives during an active cycle, queue it and run one follow-up cycle after the current one completes. Coalesce multiple queued events into a single cycle.
+- **Timestamp-based deduplication**: Track the timestamp of the last completed sync cycle per library. Skip a triggered cycle if less than 1 second has elapsed since the last one (rapid-fire events from a single batch sync).
+- **Event source attribution**: Log which source triggered each sync cycle (filesystem, WebSocket, polling) for debugging and tuning.
+
+```python
+class SyncThrottle:
+    def __init__(self, min_interval: float = 1.0):
+        self.lock = asyncio.Lock()
+        self.last_sync: float = 0
+        self.pending = False
+
+    async def trigger(self, source: str):
+        if self.lock.locked():
+            self.pending = True
+            return
+        async with self.lock:
+            elapsed = time.monotonic() - self.last_sync
+            if elapsed < self.min_interval:
+                return
+            await self._run_sync_cycle(source)
+            self.last_sync = time.monotonic()
+            if self.pending:
+                self.pending = False
+                await self._run_sync_cycle("coalesced")
+                self.last_sync = time.monotonic()
+```
 
 ---
 
