@@ -14,10 +14,12 @@ The recommended architecture is a **YACReaderLibraryServer fork** with a Rust sy
 |-------|--------|--------|-----|
 | Phase 1: Shared Filesystem | Design only | — | — |
 | **Phase 2: One-Way Sync** | **Implemented** | `feat/stump-sync-phase2` | [dashed/yacreader#1](https://github.com/dashed/yacreader/pull/1) |
-| Phase 3: Two-Way Sync | Not started | — | — |
+| **Phase 3: Two-Way Sync** | **Implemented** | `feat/stump-sync-phase2` | [dashed/yacreader#1](https://github.com/dashed/yacreader/pull/1) |
 | Phase 4: Polish + Upstream | Not started | — | — |
 
 **Phase 2 metrics:** 18 files, 4,891 lines added. Rust crate: 10 source files, 2,205 lines. Tests: 38 total (29 unit + 4 integration + 5 E2E). All passing.
+
+**Phase 3 metrics:** 7 files changed, 1,123 lines added. New: bidirectional sync, periodic polling, direct .ydb writes. Tests: 56 total (41 unit + 6 bidirectional E2E + 4 integration + 5 flow). All passing.
 
 ---
 
@@ -896,7 +898,9 @@ The recommended implementation path is a **fork of YACReaderLibraryServer** with
 - Configuration reads from `QSettings` under `[StumpSync]` group (serverUrl, apiKey, userId, mappingDbPath, syncIntervalSecs).
 - 38 tests: 29 inline unit tests + 4 integration tests (mapping DB lifecycle) + 5 E2E tests (full sync flow with wiremock mock Stump server).
 
-### Phase 3: Two-Way Sync + Real-Time
+### Phase 3: Two-Way Sync + Real-Time ✅ IMPLEMENTED
+
+> **Status:** Implemented on branch [`feat/stump-sync-phase2`](https://github.com/dashed/yacreader/pull/1).
 
 **Goal**: Progress flows in both directions. Reading on any client updates both systems.
 
@@ -908,15 +912,20 @@ The recommended implementation path is a **fork of YACReaderLibraryServer** with
    - `currentPage`: `max(yacreader, stump)`
    - `read` / completion: `OR` (once read, stays read)
    - `lastTimeOpened` / `updated_at`: latest timestamp wins (LWW)
-3. Add Rust → C++ callback for updating YACReader's `.ydb`:
-   - Rust calls a C++ function via the `cxx` bridge
-   - C++ side uses `QMetaObject::invokeMethod(Qt::QueuedConnection)` to marshal to the Qt thread (§9.5)
-   - Writes to YACReader DB via existing `DBHelper` functions
+3. ~~Add Rust → C++ callback for updating YACReader's `.ydb`~~ → **Direct Rust writes** to .ydb via rusqlite (see implementation notes)
 4. Test: read in Stump web reader → Rust module detects change → writes to YACReader → progress visible on next iOS sync.
 
 **Outcome**: Full bidirectional sync. Reading on iPhone (via YACReader) or desktop/web (via Stump) updates both systems.
 
 **Effort**: ~1–2 weeks of additional development.
+
+**Implementation notes (deviations from original plan):**
+- **Direct rusqlite writes instead of C++ callbacks** — Rust opens the .ydb in read-write mode and UPDATEs comic_info directly. This avoids the entire `extern "C++"` / QMetaObject::invokeMethod complexity, keeps `cargo test` working without C++, and is safe because YACReader uses per-thread SQLite connections with no global lock. Validation logic replicated: `hasBeenOpened = (page > 1)`, `read = true when page >= numPages`.
+- **`sync_all()` method** — combined bidirectional sync in one pass: reads both systems, computes bidirectional deltas, applies pushes (GraphQL) and pulls (.ydb writes) in a single cycle.
+- **Periodic polling** — `tokio::select!` with configurable `sync_interval_secs` timer. When > 0, `sync_all()` runs automatically on the interval. The first tick is skipped (no immediate sync on startup).
+- **`read_all_yac_comics()`** — variant without `WHERE hasBeenOpened = 1` filter, so Stump progress for comics not yet opened in YACReader can be pulled.
+- **`compute_bidirectional_delta()`** — max-page-wins conflict resolution with OR completion logic. Page priority takes precedence over completion direction.
+- 56 tests: 41 unit + 6 bidirectional E2E (pull, mixed, conflict, completion, sync state, push regression) + 4 integration + 5 flow.
 
 ### Phase 4: Polish and Optional Upstream
 
