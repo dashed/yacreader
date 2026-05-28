@@ -6,7 +6,18 @@ This document analyzes the feasibility and architecture for synchronizing readin
 
 Both servers scan the same comic library on a shared filesystem. Stump serves as the source of truth for library organization and metadata, while YACReaderLibraryServer provides the backend for YACReader iOS. The core challenge is that **the two systems use incompatible content-hashing algorithms** (YACReader: SHA1 of first 512 KB + filesize; Stump: SHA256 of four 10 KB samples), meaning content-based identity matching is not directly possible. The recommended approach uses **relative-path matching** as the primary identity strategy, since both servers index the same directory tree.
 
-The recommended architecture is a **Python sidecar service** that polls both systems, maintains an ID-mapping database, and writes progress updates through each system's existing API. Implementation proceeds in four phases: shared filesystem (no code), one-way sync (YACReader → Stump), two-way sync, and finally an optional embedded integration in a YACReaderLibraryServer fork.
+The recommended architecture is a **YACReaderLibraryServer fork** with a Rust sync module integrated via cxx FFI and corrosion CMake module. The Rust module handles GraphQL communication with Stump, ID mapping, and sync logic, while C++ handles Qt signal integration and server lifecycle. A Python sidecar alternative is documented in §6 but the fork approach is preferred. Implementation proceeds in four phases: shared filesystem (no code), one-way sync (YACReader → Stump), two-way sync, and polish/upstream contributions.
+
+### Implementation Status
+
+| Phase | Status | Branch | PR |
+|-------|--------|--------|-----|
+| Phase 1: Shared Filesystem | Design only | — | — |
+| **Phase 2: One-Way Sync** | **Implemented** | `feat/stump-sync-phase2` | [dashed/yacreader#1](https://github.com/dashed/yacreader/pull/1) |
+| Phase 3: Two-Way Sync | Not started | — | — |
+| Phase 4: Polish + Upstream | Not started | — | — |
+
+**Phase 2 metrics:** 18 files, 4,891 lines added. Rust crate: 10 source files, 2,205 lines. Tests: 38 total (29 unit + 4 integration + 5 E2E). All passing.
 
 ---
 
@@ -853,7 +864,10 @@ The recommended implementation path is a **fork of YACReaderLibraryServer** with
 
 **Effort**: ~1 hour of setup.
 
-### Phase 2: Fork with One-Way Sync (YACReader → Stump)
+### Phase 2: Fork with One-Way Sync (YACReader → Stump) ✅ IMPLEMENTED
+
+> **Status:** Implemented on branch [`feat/stump-sync-phase2`](https://github.com/dashed/yacreader/pull/1).
+> **PR:** [dashed/yacreader#1](https://github.com/dashed/yacreader/pull/1)
 
 **Goal**: When YACReader iOS syncs progress, it automatically pushes to Stump.
 
@@ -873,6 +887,14 @@ The recommended implementation path is a **fork of YACReaderLibraryServer** with
 **Outcome**: Stump reflects YACReader reading progress in near-real-time (<100ms after iOS sync completes). Only 3 files modified in the YACReader codebase (§9.1).
 
 **Effort**: ~1–2 weeks of development.
+
+**Implementation notes (deviations from original plan):**
+- Added `ffi` Cargo feature flag — `cxx` dependency is optional, gated behind `ffi` feature. This allows `cargo test` to run without a C++ toolchain. The CMake build uses `corrosion_import_crate(... FEATURES ffi)`.
+- Crate type includes both `staticlib` (for C++ linking) and `lib` (for `cargo test`).
+- `extern "C++"` block deferred to Phase 3 — Phase 2 is one-way (C++ calls Rust), so no Rust→C++ callbacks needed. This eliminates the need for C++ stubs during testing.
+- `MappingDb` wraps `rusqlite::Connection` in `std::sync::Mutex` for thread safety with tokio.
+- Configuration reads from `QSettings` under `[StumpSync]` group (serverUrl, apiKey, userId, mappingDbPath, syncIntervalSecs).
+- 38 tests: 29 inline unit tests + 4 integration tests (mapping DB lifecycle) + 5 E2E tests (full sync flow with wiremock mock Stump server).
 
 ### Phase 3: Two-Way Sync + Real-Time
 
@@ -1867,19 +1889,24 @@ impl MappingDb {
 stump_sync/
 ├── Cargo.toml               — Package definition + dependencies
 ├── Cargo.lock               — Locked dependency versions (committed)
-├── build.rs                 — cxx build script (generates C++ bridge code)
+├── build.rs                 — cxx build script (gated behind ffi feature)
 ├── src/
-│   ├── lib.rs               — cxx bridge definition + FFI entry points + Tokio init
-│   ├── sync_engine.rs       — Core sync loop: receive commands, compare, write
-│   ├── stump_client.rs      — GraphQL/HTTP client + optional WebSocket subscription
-│   ├── mapping_db.rs        — rusqlite ID mapping database operations
-│   ├── config.rs            — Configuration types + TOML/YAML parsing
-│   ├── types.rs             — Internal data types (MediaProgress, SyncDelta, etc.)
+│   ├── lib.rs               — cxx bridge definition (behind ffi feature) + FFI entry points
+│   ├── sync_engine.rs       — Core sync loop: path matching, delta computation, push
+│   ├── stump_client.rs      — GraphQL/HTTP client with retry logic
+│   ├── mapping_db.rs        — Mutex-wrapped rusqlite ID mapping database
+│   ├── runtime.rs           — Tokio runtime management + mpsc command channel
+│   ├── config.rs            — Configuration types (Config, LibraryConfig)
+│   ├── types.rs             — Internal data types (ComicProgress, StumpMedia, SyncDelta, SyncError)
 │   └── schema.sql           — Mapping DB schema (included via include_str!)
-└── stump_sync_callbacks.h   — C++ header declaring callback functions for Rust → C++
+└── tests/
+    ├── common/
+    │   └── mod.rs            — Test fixtures (temp .ydb creation, mock Stump server)
+    ├── test_mapping.rs       — Integration tests for mapping DB lifecycle
+    └── test_sync_flow.rs     — E2E tests: full sync flow with wiremock mock server
 ```
 
-**`Cargo.toml`:**
+**`Cargo.toml`** (as implemented):
 
 ```toml
 [package]
@@ -1887,38 +1914,47 @@ name = "stump-sync"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+ffi = ["dep:cxx"]
+
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
-cxx = "1"
-futures-util = "0.3"  # for StreamExt on WebSocket
+cxx = { version = "1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+tokio = { version = "1", features = ["test-util"] }
 
 [build-dependencies]
 cxx-build = "1"
 
 [lib]
-crate-type = ["staticlib"]
-
-[profile.release]
-opt-level = "z"   # minimize binary size
-lto = true        # link-time optimization
-strip = true      # strip debug symbols
+crate-type = ["staticlib", "lib"]
 ```
 
-**`build.rs`:**
+**`build.rs`** (as implemented):
 
 ```rust
 fn main() {
-    cxx_build::bridge("src/lib.rs")
-        .flag_if_supported("-std=c++17")
-        .compile("stump_sync_cxx");
+    if std::env::var("CARGO_FEATURE_FFI").is_ok() {
+        cxx_build::bridge("src/lib.rs")
+            .flag_if_supported("-std=c++17")
+            .compile("stump_sync_cxx");
+    }
 }
+```
+
+**CMake integration** (in top-level `CMakeLists.txt`):
+```cmake
+corrosion_import_crate(MANIFEST_PATH ${CMAKE_SOURCE_DIR}/stump_sync/Cargo.toml FEATURES ffi)
 ```
 
 ---
