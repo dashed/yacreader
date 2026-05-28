@@ -837,6 +837,8 @@ volumes:
 
 ## 7. Implementation Phases
 
+The recommended implementation path is a **fork of YACReaderLibraryServer** with a Rust sync module linked via FFI. This approach embeds sync directly into the server process, eliminates the sidecar deployment, and leverages YACReaderLibraryServer's existing Qt signals for near-instant event-driven sync. See §9 for the full Rust FFI architecture.
+
 ### Phase 1: Shared Filesystem (No Code Changes)
 
 **Goal**: Both servers index the same comic library.
@@ -851,62 +853,78 @@ volumes:
 
 **Effort**: ~1 hour of setup.
 
-### Phase 2: One-Way Progress Sync (YACReader → Stump)
+### Phase 2: Fork with One-Way Sync (YACReader → Stump)
 
-**Goal**: Reading progress from YACReader iOS appears in Stump.
+**Goal**: When YACReader iOS syncs progress, it automatically pushes to Stump.
 
 **Steps**:
-1. Build the sync sidecar (Python) with:
-   - YACReader `.ydb` reader (SQLite, read-only)
-   - Stump GraphQL client (write progress)
-   - Path-based media matching
-   - Mapping DB (`mapping.db`)
-2. Implement the sync cycle (read YAC → match → write Stump).
-3. Deploy as a Docker container or systemd service.
-4. Test: read a comic on iPhone, verify progress appears in Stump.
+1. Fork YACReaderLibraryServer.
+2. Add the Rust `stump_sync` crate (§9.9) with:
+   - GraphQL client for Stump progress mutations via `reqwest` (§9.7)
+   - Path-based ID mapping with `rusqlite` (§9.8)
+   - `cxx` FFI bridge exposing `rust_sync_init`, `rust_sync_push_progress`, `rust_sync_shutdown` (§9.3)
+   - Tokio runtime with command channel (§9.4)
+3. Integrate into the build via `corrosion` CMake module (§9.6).
+4. In `main.cpp`, connect existing Qt signals to Rust FFI calls (§9.5):
+   - `comicUpdated(libraryId, comicId)` → `rust_sync_push_progress()`
+   - `clientSync()` → `rust_sync_push_all()`
+5. Test: read a comic on iPhone → YACReader iOS syncs to server → signal fires → Rust pushes progress to Stump.
 
-**Outcome**: Stump reflects YACReader reading progress. Stump-originated progress is not synced back.
+**Outcome**: Stump reflects YACReader reading progress in near-real-time (<100ms after iOS sync completes). Only 3 files modified in the YACReader codebase (§9.1).
 
-**Effort**: ~2–3 days of development.
+**Effort**: ~1–2 weeks of development.
 
-**Real-time enhancement** (adds ~1 day): Add `PRAGMA data_version` polling and filesystem `watchdog` observer on the `.ydb` file (§5.5.3). This reduces YACReader → Stump sync latency from 0–60s to 0–5s without any code changes to either server. The sidecar triggers an immediate targeted sync cycle when it detects a database change, rather than waiting for the next polling interval.
-
-### Phase 3: Two-Way Progress Sync
+### Phase 3: Two-Way Sync + Real-Time
 
 **Goal**: Progress flows in both directions. Reading on any client updates both systems.
 
 **Steps**:
-1. Add Stump → YACReader sync to the sidecar:
-   - Stump GraphQL reader (query progress)
-   - YACReader HTTP API writer (`POST /v2/sync`)
-2. Implement conflict resolution (§5.3).
-3. Handle Stump completion events (finished sessions → YACReader `read` flag).
-4. Test: read in Stump web reader, verify progress appears in YACReader iOS on next sync.
+1. Add Stump → YACReader progress pulling to the Rust module:
+   - Polling: periodic GraphQL query for progress changes (timer-based or `PRAGMA data_version` on Stump's DB if co-located)
+   - Optional: WebSocket subscription to Stump's `readEvents` for library structure changes (§5.5.2)
+2. Implement conflict resolution in the Rust sync engine (§5.3):
+   - `currentPage`: `max(yacreader, stump)`
+   - `read` / completion: `OR` (once read, stays read)
+   - `lastTimeOpened` / `updated_at`: latest timestamp wins (LWW)
+3. Add Rust → C++ callback for updating YACReader's `.ydb`:
+   - Rust calls a C++ function via the `cxx` bridge
+   - C++ side uses `QMetaObject::invokeMethod(Qt::QueuedConnection)` to marshal to the Qt thread (§9.5)
+   - Writes to YACReader DB via existing `DBHelper` functions
+4. Test: read in Stump web reader → Rust module detects change → writes to YACReader → progress visible on next iOS sync.
 
-**Outcome**: Full bidirectional sync. Either system can be used for reading.
+**Outcome**: Full bidirectional sync. Reading on iPhone (via YACReader) or desktop/web (via Stump) updates both systems.
 
-**Effort**: ~2–3 additional days.
+**Effort**: ~1–2 weeks of additional development.
 
-**Real-time enhancement** (adds ~1 day): Add Stump WebSocket subscription for library structure events (§5.5.2). The sidecar subscribes to `readEvents` via `GET /api/graphql/ws` and rebuilds ID mappings instantly when new media is indexed. If the `ReadingProgressUpdated` event is contributed upstream (~20 lines of Rust), this also enables instant Stump → YACReader progress sync — the sidecar receives progress changes over WebSocket and immediately writes them to YACReader via `POST /v2/sync`.
+### Phase 4: Polish and Optional Upstream
 
-### Phase 4: Embedded Sync in YACReaderLibraryServer Fork (Optional)
-
-**Goal**: Eliminate the sidecar by embedding Stump sync directly into YACReaderLibraryServer.
+**Goal**: Production-quality deployment and community contributions.
 
 **Steps**:
-1. Fork YACReaderLibraryServer.
-2. Add a C++/Qt module that:
-   - Communicates with Stump's GraphQL API via `QNetworkAccessManager`
-   - Runs sync on a configurable timer
-   - Stores mapping state in the library `.ydb` (new table) or a separate DB
-3. Add configuration UI or config file support for Stump connection details.
-4. Merge sync logic from Phase 3 Python into C++.
+1. Contribute `ReadingProgressUpdated` CoreEvent to Stump (~20 lines of Rust, §5.5.2). This enables instant Stump → YACReader sync via WebSocket instead of polling.
+2. Add configuration support:
+   - Config file (`stump_sync.toml` or YAML) for Stump URL, API key, user ID, sync interval
+   - Optional: CLI flags for YACReaderLibraryServer to specify config path
+3. Docker image with Rust build stage:
+   - Multi-stage Dockerfile: Rust builder → corrosion + cargo build → copy `.a` into CMake build stage
+   - CI build matrix additions for Rust toolchain
+4. Consider upstreaming the sync module to YACReader if applicable — the `stump_sync` crate is cleanly separated and could be made optional via a CMake flag.
 
-**Outcome**: Single-server deployment. No sidecar needed.
+**Outcome**: Polished, deployable sync solution with sub-second latency in both directions.
 
-**Effort**: ~1–2 weeks. Requires C++/Qt familiarity. Consider whether the maintenance overhead justifies eliminating a simple Python sidecar.
+**Effort**: ~1 week.
 
-**Alternative real-time path**: Instead of (or before) a full C++ rewrite, a minimal fork of YACReaderLibraryServer can add webhook notifications (~10 lines of C++/Qt). After `emit clientSync()` and `emit comicUpdated(...)` in `requestmapper.cpp`, add a `QNetworkAccessManager::post()` call to a configurable webhook URL. The sidecar receives HTTP POST events with library and comic IDs, enabling sub-100ms YACReader → Stump sync with rich event data. This is a much smaller fork surface than the full embedded sync approach and preserves the Python sidecar architecture.
+### Sidecar Alternative
+
+The fork approach above is recommended for its lower deployment complexity (single process) and direct access to Qt signals for event-driven sync. However, a **Python sidecar** is a viable alternative that avoids forking YACReaderLibraryServer entirely. This was the original architecture proposed in §6.
+
+**Sidecar Phase 2** (One-Way, YAC → Stump): Build a Python sidecar with `.ydb` SQLite reader, Stump GraphQL client, path-based matching, and a mapping DB. Deploy as a Docker container alongside both servers. Effort: ~2–3 days. Latency: 0–60s (polling) or 0–5s (with `PRAGMA data_version` + filesystem `watchdog`).
+
+**Sidecar Phase 3** (Two-Way): Add Stump → YACReader sync via GraphQL reads and `POST /v2/sync` writes. Implement conflict resolution. Add Stump WebSocket subscription for library structure events. Effort: ~2–3 additional days.
+
+**Sidecar Phase 4** (Real-Time Enhancement): Add a minimal YACReaderLibraryServer fork with webhook notifications (~10 lines of C++/Qt) — after `emit clientSync()` and `emit comicUpdated(...)`, POST to a configurable URL. The sidecar receives HTTP events for sub-100ms YACReader → Stump sync. This is a much smaller fork surface than the full Rust FFI approach.
+
+**When to prefer the sidecar**: If you want to avoid maintaining a fork, need rapid prototyping, or prefer Python's iteration speed. The sidecar architecture is fully described in §6.
 
 ---
 
@@ -1050,6 +1068,857 @@ class SyncThrottle:
                 self.pending = False
                 await self._run_sync_cycle("coalesced")
                 self.last_sync = time.monotonic()
+```
+
+### 8.11 Rust–C++ FFI Complexity
+
+The `cxx` bridge provides type-safe FFI but introduces constraints:
+
+| Constraint | Impact | Mitigation |
+|------------|--------|------------|
+| No `Option<T>` in bridge types | Cannot express nullable fields directly | Use sentinel values (`-1` for missing page, empty string for missing error) or wrapper structs with `has_value: bool` |
+| No `async fn` in bridge | Cannot call async Rust from C++ directly | Post work to tokio via `mpsc` channel from bridge functions; return immediately |
+| String conversion overhead | `rust::String` ↔ `QString` requires UTF-8 encode/decode | Negligible for progress data (small strings); batch conversions for bulk operations |
+| Debugging across FFI boundary | Stack traces don't cross the Rust/C++ boundary cleanly | Use `tracing` on Rust side, `qDebug()` on C++ side; log at the FFI entry/exit points |
+| Build error messages | `cxx` codegen errors can be cryptic | Keep the bridge definition minimal; test bridge compilation independently |
+
+The bridge definition should be kept as small as possible — only the types and functions that must cross the boundary. Internal Rust logic stays in pure Rust modules.
+
+### 8.12 Tokio + Qt Event Loop Coexistence
+
+Two event loops run concurrently: Qt's `QCoreApplication::exec()` on the main thread and Tokio's multi-threaded runtime on its own thread pool.
+
+**Thread safety**: The `cxx` bridge functions are called from the Qt main thread. They must not block (would freeze the server's HTTP handling). All bridge functions post commands to the Tokio runtime via an `mpsc` channel and return immediately.
+
+**Callback marshaling**: When the Rust side needs to update YACReader's database (Stump → YAC direction), it must marshal the call back to the Qt main thread. Raw function pointer callbacks from Rust execute on a Tokio worker thread — direct `DBHelper` calls from there are safe (DBHelper opens per-thread SQLite connections), but Qt signal emission or UI updates are not. Use `QMetaObject::invokeMethod(obj, Qt::QueuedConnection)` to queue the callback on the Qt event loop.
+
+**Shutdown ordering**: The Rust runtime must shut down before `QCoreApplication` exits. Sequence:
+1. `rust_sync_shutdown()` — sends `Shutdown` command via channel
+2. Tokio runtime completes pending tasks (with timeout)
+3. Runtime drops, all Rust resources cleaned up
+4. `QCoreApplication::quit()` proceeds
+
+**Deadlock prevention**: Never hold a Rust mutex while calling back into C++, and never hold a Qt mutex while calling into Rust. The channel-based design avoids this by decoupling the two sides.
+
+### 8.13 Cross-Compilation
+
+Adding Rust to the build introduces platform-specific considerations:
+
+| Platform | Rust Target Triple | Extra Link Libraries | Notes |
+|----------|-------------------|---------------------|-------|
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | `pthread`, `dl`, `m` | Most common deployment target (Docker) |
+| Linux aarch64 | `aarch64-unknown-linux-gnu` | `pthread`, `dl`, `m` | ARM servers, Raspberry Pi |
+| macOS x86_64 | `x86_64-apple-darwin` | `Security.framework`, `SystemConfiguration.framework` | Required by `rustls-tls` |
+| macOS aarch64 | `aarch64-apple-darwin` | Same as above | Apple Silicon |
+
+**CI implications**: All CI runners must have the Rust toolchain installed. `corrosion` handles debug/release mapping and platform-specific system library linking, but the Rust target must match the C++ target when cross-compiling.
+
+**Docker builds**: Use a multi-stage Dockerfile with `rust:1.XX` as the builder stage for the `stump_sync` crate, then copy the compiled static library (`.a`) into the CMake build stage.
+
+### 8.14 Dependency Management
+
+The project now has two package managers: **Cargo** (Rust) and **CMake/system packages** (C++). This creates maintenance considerations:
+
+- **Cargo.lock**: Must be committed to version control for reproducible builds. The `stump_sync` crate is an application-like artifact (not a library published to crates.io), so locking dependencies is correct.
+- **Rust dependency updates**: `cargo update` is independent of CMake. Security advisories can be monitored via `cargo audit`. The `reqwest` + `tokio` stack has frequent releases but is stable.
+- **Vendoring**: For fully reproducible builds without network access, `cargo vendor` can download all crate sources into a local directory. This adds ~50MB to the repo but eliminates build-time network dependencies.
+- **Version pinning**: Pin `corrosion` to a specific Git tag in `FetchContent_Declare` to avoid build breakage from upstream changes.
+- **Binary size**: The Rust static library adds ~3–5MB to the final executable (with `reqwest` + `tokio` + `rusqlite`). Use `opt-level = "z"` and `lto = true` in the release profile to minimize this.
+
+---
+
+## 9. Rust FFI Fork Architecture
+
+### 9.1 Overview
+
+The recommended approach embeds a Rust sync module directly into **YACReaderLibraryServer** via a `cxx` FFI bridge. This eliminates the external sidecar process and provides direct access to Qt signals for event-driven sync with sub-100ms latency.
+
+**Why Rust FFI fork instead of a sidecar?**
+
+| Factor | Sidecar (Python) | Fork (Rust FFI) |
+|--------|-------------------|-----------------|
+| Deployment | 3 processes (Stump + YACReader + sidecar) | 2 processes (Stump + YACReader-fork) |
+| YAC → Stump latency | 0–5s (PRAGMA polling) or <100ms (webhook fork) | <100ms (direct signal connection) |
+| Change detection | External polling / filesystem watch | Internal Qt signals — zero overhead |
+| Docker complexity | 3-container compose | 2-container compose |
+| Build complexity | pip install | Rust toolchain + corrosion CMake module |
+| YACReader code changes | 0 (or ~10 lines for webhook) | 3 files modified |
+
+The fork approach is preferred because YACReaderLibraryServer already emits Qt signals (`comicUpdated`, `clientSync`) on every progress update — they just have no receivers in the headless server. Connecting them to Rust FFI calls is the most natural integration point.
+
+**Architecture diagram:**
+
+```
+┌─────────────┐
+│  iPhone      │
+│  YACReader   │──── POST /v2/sync ────┐
+│  iOS App     │                        │
+└──────────────┘                        ▼
+┌───────────────────────────────────────────────────────┐
+│  YACReaderLibraryServer (forked)                       │
+│                                                        │
+│  ┌─────────────────────┐    ┌────────────────────────┐│
+│  │ Qt HTTP Server       │    │ Rust stump_sync module ││
+│  │                      │    │                        ││
+│  │ RequestMapper        │    │ ┌────────────────────┐ ││
+│  │   emit comicUpdated ─┼────┼→│ cxx FFI bridge     │ ││
+│  │   emit clientSync   ─┼────┼→│                    │ ││
+│  │                      │    │ │ rust_sync_push_*() │ ││
+│  │ library.ydb ◄────────┼────┼─│ on_stump_progress  │ ││
+│  │ (SQLite)             │    │ └────────┬───────────┘ ││
+│  └─────────────────────┘    │          │              ││
+│                              │ ┌────────▼───────────┐ ││
+│                              │ │ Tokio runtime       │ ││
+│                              │ │ • GraphQL client    │ ││
+│                              │ │ • WebSocket client  │ ││
+│                              │ │ • Sync engine       │ ││
+│                              │ │ • ID mapping DB     │ ││
+│                              │ └────────┬───────────┘ ││
+│                              └──────────┼─────────────┘│
+└─────────────────────────────────────────┼──────────────┘
+                                          │ GraphQL / WS
+                                          ▼
+                               ┌─────────────────────┐
+                               │  Stump               │
+                               │  GraphQL :10801      │
+                               └─────────────────────┘
+```
+
+**Only 3 files in YACReaderLibraryServer need modification:**
+
+1. `YACReaderLibraryServer/CMakeLists.txt` — add corrosion + stump_sync import + link
+2. `YACReaderLibraryServer/main.cpp` — add init + signal connections + shutdown (~15 lines)
+3. New: `stump_sync/` directory — the entire Rust crate (new code, no existing file changes)
+
+### 9.2 Rust Sync Module Design
+
+The `stump_sync` crate is a self-contained Rust module that handles all communication with Stump. It runs its own async runtime (Tokio) and communicates with the C++ host via a narrow FFI bridge.
+
+**Components:**
+
+| Component | Responsibility | Key Dependencies |
+|-----------|---------------|-----------------|
+| **GraphQL client** | Query and mutate Stump reading progress | `reqwest`, `serde_json` |
+| **WebSocket client** | Subscribe to Stump `readEvents` for library structure changes | `tokio-tungstenite`, `serde_json` |
+| **ID mapping database** | Map YACReader comic IDs ↔ Stump media UUIDs via relative paths | `rusqlite` |
+| **Sync engine** | Compare progress, resolve conflicts, decide write direction | Pure Rust logic |
+| **Configuration** | Stump URL, API key, user ID, sync interval, mapping DB path | `serde`, TOML/YAML |
+
+**Data flow for YACReader → Stump (Phase 2):**
+
+```
+iPhone syncs → RequestMapper::comicUpdated(libraryId, comicId)
+  → Qt signal → C++ slot calls rust_sync_push_progress(libraryId, comicId)
+    → posts PushProgress to Tokio channel
+      → Tokio task: read comic progress from .ydb (rusqlite, read-only)
+        → look up Stump media ID in mapping DB
+          → GraphQL mutation: updateMediaProgress(id, {paged: {page}})
+```
+
+**Data flow for Stump → YACReader (Phase 3):**
+
+```
+Stump progress changes (polling or WebSocket event)
+  → Tokio task: query Stump GraphQL for updated progress
+    → compare with last-known YACReader state in mapping DB
+      → if Stump is ahead: call C++ callback on_stump_progress_update()
+        → QMetaObject::invokeMethod(Qt::QueuedConnection)
+          → Qt thread: DBHelper::updateComicProgress() writes to .ydb
+```
+
+### 9.3 FFI Boundary Design
+
+The FFI boundary uses the `cxx` crate for type-safe bidirectional communication. The bridge definition is intentionally minimal — only types and functions that must cross the Rust/C++ boundary are declared here. All internal logic stays in pure Rust.
+
+```rust
+// stump_sync/src/lib.rs
+
+#[cxx::bridge(namespace = "stump_sync")]
+mod ffi {
+    // Shared types — visible to both Rust and C++
+    struct SyncConfig {
+        stump_url: String,
+        api_key: String,
+        user_id: String,
+        sync_interval_secs: u32,
+        mapping_db_path: String,
+        ydb_paths: Vec<String>,       // paths to YACReader .ydb files
+        library_roots: Vec<String>,   // corresponding filesystem roots
+    }
+
+    struct ProgressUpdate {
+        comic_info_id: i64,
+        stump_media_id: String,
+        current_page: i32,
+        is_read: bool,
+        last_opened: i64,            // epoch seconds
+    }
+
+    struct SyncResult {
+        success: bool,
+        error_message: String,        // empty if success (no Option<T> in cxx)
+    }
+
+    struct SyncStatus {
+        is_running: bool,
+        last_sync_epoch: i64,         // 0 if never synced
+        pending_updates: u32,
+        error_message: String,        // empty if no error
+    }
+
+    // Rust functions exposed to C++
+    extern "Rust" {
+        fn rust_sync_init(config: &SyncConfig) -> SyncResult;
+        fn rust_sync_push_progress(library_id: i64, comic_id: i64);
+        fn rust_sync_push_all();
+        fn rust_sync_pull_all();
+        fn rust_sync_shutdown() -> SyncResult;
+        fn rust_sync_status() -> SyncStatus;
+    }
+
+    // C++ functions that Rust can call (callbacks)
+    unsafe extern "C++" {
+        include!("stump_sync_callbacks.h");
+
+        fn on_stump_progress_update(
+            comic_info_id: i64,
+            page: i32,
+            is_read: bool,
+            last_opened: i64,
+        );
+    }
+}
+```
+
+**Type mapping notes:**
+
+| Rust type | C++ type (via cxx) | Notes |
+|-----------|-------------------|-------|
+| `String` | `rust::String` | Convert to `QString` via `QString::fromUtf8(s.data(), s.size())` |
+| `Vec<String>` | `rust::Vec<rust::String>` | Iterable from C++ |
+| `i64`, `i32`, `u32` | `int64_t`, `int32_t`, `uint32_t` | Direct mapping |
+| `bool` | `bool` | Direct mapping |
+| `&SyncConfig` | `const SyncConfig&` | Shared struct, passed by reference |
+
+### 9.4 Tokio Runtime Integration
+
+The Rust module runs a Tokio multi-threaded runtime alongside Qt's event loop. The runtime is initialized once via `OnceLock` and communicates with the FFI bridge through an `mpsc` channel.
+
+```rust
+// stump_sync/src/lib.rs (runtime management)
+
+use std::sync::OnceLock;
+use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
+
+static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+static CMD_TX: OnceLock<mpsc::UnboundedSender<SyncCommand>> = OnceLock::new();
+
+enum SyncCommand {
+    PushProgress { library_id: i64, comic_id: i64 },
+    PushAll,
+    PullAll,
+    FullSync,
+    Shutdown(tokio::sync::oneshot::Sender<()>),
+}
+
+fn rust_sync_init(config: &ffi::SyncConfig) -> ffi::SyncResult {
+    let rt = RUNTIME.get_or_init(|| {
+        Runtime::new().expect("failed to create tokio runtime")
+    });
+
+    let (tx, rx) = mpsc::unbounded_channel::<SyncCommand>();
+    CMD_TX.set(tx).expect("rust_sync_init called twice");
+
+    let config = config.clone().into(); // convert to internal Config type
+
+    rt.spawn(async move {
+        sync_engine::run(rx, config).await;
+    });
+
+    ffi::SyncResult { success: true, error_message: String::new() }
+}
+
+fn rust_sync_push_progress(library_id: i64, comic_id: i64) {
+    if let Some(tx) = CMD_TX.get() {
+        let _ = tx.send(SyncCommand::PushProgress { library_id, comic_id });
+    }
+}
+
+fn rust_sync_push_all() {
+    if let Some(tx) = CMD_TX.get() {
+        let _ = tx.send(SyncCommand::PushAll);
+    }
+}
+
+fn rust_sync_pull_all() {
+    if let Some(tx) = CMD_TX.get() {
+        let _ = tx.send(SyncCommand::PullAll);
+    }
+}
+
+fn rust_sync_shutdown() -> ffi::SyncResult {
+    if let Some(tx) = CMD_TX.get() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(SyncCommand::Shutdown(done_tx));
+
+        if let Some(rt) = RUNTIME.get() {
+            // Block briefly to allow graceful shutdown (max 5 seconds)
+            let _ = rt.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    done_rx,
+                ).await
+            });
+        }
+    }
+    ffi::SyncResult { success: true, error_message: String::new() }
+}
+```
+
+**Thread safety guarantees:**
+
+- `OnceLock` ensures the runtime and channel sender are initialized exactly once.
+- `mpsc::UnboundedSender` is `Send + Sync` — safe to call from the Qt main thread.
+- `send()` is non-blocking — returns immediately, never stalls the Qt event loop.
+- The Tokio runtime's thread pool is independent of Qt threads.
+
+### 9.5 Qt Signal Integration
+
+YACReaderLibraryServer already emits two Qt signals on progress updates that have **no receivers** in the headless server. The fork connects them to Rust FFI calls.
+
+**Existing signals (already emitted, no code changes needed):**
+
+| Signal | Emitted From | When |
+|--------|-------------|------|
+| `YACReaderHttpServer::comicUpdated(qulonglong libraryId, qulonglong comicId)` | `requestmapper.cpp:153` | Single comic progress update from iOS |
+| `YACReaderHttpServer::clientSync()` | `requestmapper.cpp:131` | Batch sync from iOS (`POST /v2/sync`) |
+
+**Modifications to `main.cpp`:**
+
+```cpp
+// YACReaderLibraryServer/main.cpp — additions for Stump sync
+// (lines reference the existing start() function)
+
+#include "stump_sync/src/lib.rs.h"  // cxx-generated header
+
+// --- In start(), after LibrariesUpdateCoordinator init (line 251) ---
+
+// Initialize Rust sync module
+stump_sync::SyncConfig syncConfig;
+syncConfig.stump_url = "http://localhost:10801";  // TODO: read from config file
+syncConfig.api_key = "your-api-key";
+syncConfig.user_id = "stump-user-uuid";
+syncConfig.sync_interval_secs = 300;
+syncConfig.mapping_db_path = "/data/sync/mapping.db";
+// ... populate ydb_paths and library_roots from library list ...
+
+auto initResult = stump_sync::rust_sync_init(syncConfig);
+if (!initResult.success) {
+    qWarning() << "Stump sync init failed:"
+               << QString::fromUtf8(initResult.error_message.data(),
+                                     initResult.error_message.size());
+}
+
+// Connect existing signals to Rust sync
+QObject::connect(
+    httpServer, &YACReaderHttpServer::comicUpdated,
+    [](qulonglong libraryId, qulonglong comicId) {
+        stump_sync::rust_sync_push_progress(
+            static_cast<int64_t>(libraryId),
+            static_cast<int64_t>(comicId)
+        );
+    }
+);
+
+QObject::connect(
+    httpServer, &YACReaderHttpServer::clientSync,
+    []() {
+        stump_sync::rust_sync_push_all();
+    }
+);
+
+// --- Before app.exec() (line 253) --- no changes needed
+
+// --- In shutdown section (lines 258–265), before return ---
+stump_sync::rust_sync_shutdown();
+```
+
+**Callback from Rust → C++ (Stump → YACReader direction):**
+
+```cpp
+// stump_sync_callbacks.h — C++ function callable from Rust
+
+#include <QMetaObject>
+#include <QCoreApplication>
+
+// Called from a Tokio worker thread — must marshal to Qt thread
+void on_stump_progress_update(
+    int64_t comic_info_id, int32_t page,
+    bool is_read, int64_t last_opened
+) {
+    QMetaObject::invokeMethod(
+        QCoreApplication::instance(),
+        [=]() {
+            // Now on the Qt main thread — safe to use DBHelper
+            DBHelper::updateComicProgress(comic_info_id, page, is_read, last_opened);
+        },
+        Qt::QueuedConnection
+    );
+}
+```
+
+### 9.6 CMake Integration
+
+The Rust crate is integrated into YACReaderLibraryServer's CMake build using the `corrosion` module, which bridges Cargo and CMake.
+
+**Full CMake additions for `YACReaderLibraryServer/CMakeLists.txt`:**
+
+```cmake
+# --- Rust stump_sync integration ---
+
+# Fetch corrosion (Rust-CMake bridge)
+include(FetchContent)
+FetchContent_Declare(
+    Corrosion
+    GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+    GIT_TAG v0.5.1  # pin to specific release
+)
+FetchContent_MakeAvailable(Corrosion)
+
+# Import the Rust crate as a CMake target
+corrosion_import_crate(
+    MANIFEST_PATH ${CMAKE_SOURCE_DIR}/stump_sync/Cargo.toml
+)
+
+# Link the Rust static library into the server executable
+target_link_libraries(YACReaderLibraryServer
+    PRIVATE
+    stump-sync  # target name from Cargo.toml [package].name
+)
+
+# Platform-specific system libraries required by Rust dependencies
+if(UNIX AND NOT APPLE)
+    target_link_libraries(YACReaderLibraryServer PRIVATE pthread dl m)
+elseif(APPLE)
+    target_link_libraries(YACReaderLibraryServer PRIVATE
+        "-framework Security"
+        "-framework SystemConfiguration"
+    )
+endif()
+
+# Include path for cxx-generated headers
+target_include_directories(YACReaderLibraryServer
+    PRIVATE
+    ${CMAKE_BINARY_DIR}/corrosion_generated/cxxbridge/stump-sync/src/
+)
+```
+
+**Updated dependency chain (standalone mode):**
+
+```
+YACReaderLibraryServer (executable)
+├── library_common (STATIC)
+├── db_helper (STATIC)
+├── server (STATIC) — REST API handlers
+├── common_all (STATIC)
+├── comic_backend (STATIC)
+├── cbx_backend (STATIC)
+├── naturalsort, yr_global (STATIC)
+├── QsLog, QrCode, QtWebApp_httpserver (STATIC)
+└── stump-sync (STATIC IMPORTED — Rust via corrosion)
+    ├── reqwest (HTTP client)
+    ├── tokio (async runtime)
+    ├── rusqlite (SQLite for ID mapping)
+    ├── serde + serde_json (serialization)
+    ├── chrono (timestamps)
+    └── cxx (FFI bridge)
+```
+
+### 9.7 Stump API Client
+
+The Rust module implements its own lightweight Stump client using `reqwest` + hand-written GraphQL queries. This avoids depending on Stump's internal crates (which would pull in SeaORM + async-graphql + 100+ transitive dependencies).
+
+**Authentication:**
+
+```rust
+// stump_sync/src/stump_client.rs
+
+use reqwest::Client;
+
+pub struct StumpClient {
+    client: Client,
+    base_url: String,
+    api_key: String,
+}
+
+impl StumpClient {
+    pub fn new(base_url: &str, api_key: &str) -> Self {
+        let client = Client::builder()
+            .default_headers({
+                let mut h = reqwest::header::HeaderMap::new();
+                h.insert("Authorization", format!("Bearer {}", api_key).parse().unwrap());
+                h
+            })
+            .build()
+            .expect("failed to build HTTP client");
+
+        Self {
+            client,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            api_key: api_key.to_string(),
+        }
+    }
+}
+```
+
+**GraphQL queries:**
+
+```rust
+impl StumpClient {
+    // Fetch all media with progress for a specific library
+    pub async fn get_library_progress(&self, library_id: &str)
+        -> Result<Vec<MediaProgress>, SyncError>
+    {
+        let query = r#"
+            query GetLibraryMedia($id: String!) {
+                library(id: $id) {
+                    series {
+                        media {
+                            id
+                            name
+                            pages
+                            path
+                            size
+                            readProgress {
+                                page
+                                percentageCompleted
+                                updatedAt
+                            }
+                            readHistory {
+                                completedAt
+                            }
+                        }
+                    }
+                }
+            }
+        "#;
+
+        let resp = self.client
+            .post(format!("{}/api/graphql", self.base_url))
+            .json(&serde_json::json!({
+                "query": query,
+                "variables": { "id": library_id }
+            }))
+            .send()
+            .await?;
+
+        let body: GraphQLResponse<LibraryData> = resp.json().await?;
+        // ... extract and flatten media list ...
+        Ok(media_progress)
+    }
+
+    // Push a page progress update
+    pub async fn update_progress(&self, media_id: &str, page: i32)
+        -> Result<(), SyncError>
+    {
+        let mutation = r#"
+            mutation UpdateProgress($id: String!, $page: Int!) {
+                updateMediaProgress(id: $id, input: { paged: { page: $page } }) {
+                    ... on ActiveReadingSession { page updatedAt }
+                    ... on FinishedReadingSession { completedAt }
+                }
+            }
+        "#;
+
+        self.client
+            .post(format!("{}/api/graphql", self.base_url))
+            .json(&serde_json::json!({
+                "query": mutation,
+                "variables": { "id": media_id, "page": page }
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+
+        Ok(())
+    }
+
+    // Mark a media item as complete
+    pub async fn mark_complete(&self, media_id: &str, is_complete: bool)
+        -> Result<(), SyncError>
+    {
+        let mutation = r#"
+            mutation MarkComplete($id: String!, $isComplete: Boolean!) {
+                markMediaAsComplete(id: $id, isComplete: $isComplete)
+            }
+        "#;
+
+        self.client
+            .post(format!("{}/api/graphql", self.base_url))
+            .json(&serde_json::json!({
+                "query": mutation,
+                "variables": { "id": media_id, "isComplete": is_complete }
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+
+        Ok(())
+    }
+}
+```
+
+**Error handling and retry logic:**
+
+```rust
+impl StumpClient {
+    async fn graphql_request_with_retry<T: serde::de::DeserializeOwned>(
+        &self, query: &str, variables: serde_json::Value,
+    ) -> Result<T, SyncError> {
+        let mut attempts = 0;
+        let max_retries = 3;
+        let mut delay = std::time::Duration::from_secs(1);
+
+        loop {
+            match self.execute_graphql(query, &variables).await {
+                Ok(data) => return Ok(data),
+                Err(e) if e.is_retryable() && attempts < max_retries => {
+                    attempts += 1;
+                    tracing::warn!(attempt = attempts, error = %e, "retrying GraphQL request");
+                    tokio::time::sleep(delay).await;
+                    delay *= 2; // exponential backoff
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+```
+
+**Optional WebSocket subscription for library events:**
+
+```rust
+// stump_sync/src/stump_client.rs — WebSocket subscription
+
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+impl StumpClient {
+    pub async fn subscribe_events(&self, tx: mpsc::UnboundedSender<StumpEvent>) {
+        let ws_url = format!(
+            "{}/api/graphql/ws",
+            self.base_url.replace("http", "ws")
+        );
+
+        loop {
+            match connect_async(&ws_url).await {
+                Ok((mut ws, _)) => {
+                    // graphql-ws protocol init
+                    let _ = ws.send(Message::Text(
+                        r#"{"type":"connection_init"}"#.into()
+                    )).await;
+
+                    // Subscribe to readEvents
+                    let _ = ws.send(Message::Text(serde_json::json!({
+                        "id": "1",
+                        "type": "subscribe",
+                        "payload": {
+                            "query": "subscription { readEvents { __typename } }"
+                        }
+                    }).to_string().into())).await;
+
+                    while let Some(Ok(msg)) = ws.next().await {
+                        if let Message::Text(text) = msg {
+                            if let Ok(event) = serde_json::from_str::<WsMessage>(&text) {
+                                if event.r#type == "next" {
+                                    let _ = tx.send(StumpEvent::from(event));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "WebSocket connection failed, retrying in 10s");
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
+            }
+        }
+    }
+}
+```
+
+### 9.8 ID Mapping Database
+
+The Rust module maintains its own SQLite database for mapping YACReader comic IDs to Stump media UUIDs. This database is separate from both YACReader's `.ydb` and Stump's database.
+
+**Schema:**
+
+```sql
+-- Stored at the path specified in SyncConfig.mapping_db_path
+-- e.g., /data/sync/stump_mapping.db
+
+CREATE TABLE library_mapping (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    yac_library_id     TEXT NOT NULL,      -- YACReader library UUID (from .yacreaderlibrary/id)
+    yac_library_name   TEXT,
+    stump_library_id   TEXT NOT NULL,      -- Stump library UUID
+    stump_library_name TEXT,
+    yac_library_root   TEXT NOT NULL,      -- YACReader library path
+    stump_library_root TEXT NOT NULL,      -- Stump library path (for path prefix stripping)
+    UNIQUE(yac_library_id, stump_library_id)
+);
+
+CREATE TABLE media_mapping (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    library_mapping_id  INTEGER NOT NULL REFERENCES library_mapping(id),
+    yac_comic_info_id   INTEGER NOT NULL,  -- comic_info.id in YACReader
+    yac_comic_id        INTEGER NOT NULL,  -- comic.id in YACReader
+    stump_media_id      TEXT NOT NULL,     -- media.id (UUID) in Stump
+    relative_path       TEXT NOT NULL,     -- Normalized relative path from library root
+    filename            TEXT NOT NULL,
+    matched_via         TEXT NOT NULL,     -- "path" | "filename_size" | "manual"
+    matched_at          TEXT NOT NULL,     -- ISO 8601 timestamp
+    UNIQUE(yac_comic_info_id, stump_media_id)
+);
+
+CREATE TABLE sync_state (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    media_mapping_id    INTEGER NOT NULL UNIQUE REFERENCES media_mapping(id),
+    yac_current_page    INTEGER DEFAULT 0,
+    stump_current_page  INTEGER DEFAULT 0,
+    yac_read            INTEGER DEFAULT 0, -- boolean
+    stump_complete      INTEGER DEFAULT 0, -- boolean
+    yac_last_modified   INTEGER DEFAULT 0, -- epoch seconds
+    stump_last_modified TEXT,              -- ISO 8601
+    last_synced_at      TEXT NOT NULL      -- ISO 8601
+);
+```
+
+**Population strategy:**
+
+1. **First sync**: The Rust module reads all media from Stump (via GraphQL) and all comics from YACReader (via read-only SQLite on `.ydb`). It matches them using the hybrid strategy from §5.1:
+   - **Primary**: Normalize both paths to relative form and compare.
+   - **Fallback**: Match by filename + file size for moved files.
+2. **Incremental updates**: When Stump emits `CreatedMedia` or `CreatedOrUpdatedManyMedia` events (via WebSocket), or when a new comic appears in YACReader, the module matches only the new entries.
+3. **Manual overrides**: The `matched_via = "manual"` type supports config-file-driven mappings for edge cases that automated matching cannot resolve.
+
+**Rust mapping database module:**
+
+```rust
+// stump_sync/src/mapping_db.rs
+
+use rusqlite::Connection;
+
+pub struct MappingDb {
+    conn: Connection,
+}
+
+impl MappingDb {
+    pub fn open(path: &str) -> Result<Self, rusqlite::Error> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(include_str!("schema.sql"))?;
+        Ok(Self { conn })
+    }
+
+    pub fn get_stump_id(&self, yac_comic_info_id: i64) -> Option<String> {
+        self.conn.query_row(
+            "SELECT stump_media_id FROM media_mapping WHERE yac_comic_info_id = ?1",
+            [yac_comic_info_id],
+            |row| row.get(0),
+        ).ok()
+    }
+
+    pub fn get_yac_id(&self, stump_media_id: &str) -> Option<i64> {
+        self.conn.query_row(
+            "SELECT yac_comic_info_id FROM media_mapping WHERE stump_media_id = ?1",
+            [stump_media_id],
+            |row| row.get(0),
+        ).ok()
+    }
+
+    pub fn insert_mapping(
+        &self,
+        library_mapping_id: i64,
+        yac_comic_info_id: i64,
+        yac_comic_id: i64,
+        stump_media_id: &str,
+        relative_path: &str,
+        filename: &str,
+        matched_via: &str,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO media_mapping
+             (library_mapping_id, yac_comic_info_id, yac_comic_id,
+              stump_media_id, relative_path, filename, matched_via, matched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))",
+            rusqlite::params![
+                library_mapping_id, yac_comic_info_id, yac_comic_id,
+                stump_media_id, relative_path, filename, matched_via
+            ],
+        )?;
+        Ok(())
+    }
+}
+```
+
+### 9.9 Module File Structure
+
+```
+stump_sync/
+├── Cargo.toml               — Package definition + dependencies
+├── Cargo.lock               — Locked dependency versions (committed)
+├── build.rs                 — cxx build script (generates C++ bridge code)
+├── src/
+│   ├── lib.rs               — cxx bridge definition + FFI entry points + Tokio init
+│   ├── sync_engine.rs       — Core sync loop: receive commands, compare, write
+│   ├── stump_client.rs      — GraphQL/HTTP client + optional WebSocket subscription
+│   ├── mapping_db.rs        — rusqlite ID mapping database operations
+│   ├── config.rs            — Configuration types + TOML/YAML parsing
+│   ├── types.rs             — Internal data types (MediaProgress, SyncDelta, etc.)
+│   └── schema.sql           — Mapping DB schema (included via include_str!)
+└── stump_sync_callbacks.h   — C++ header declaring callback functions for Rust → C++
+```
+
+**`Cargo.toml`:**
+
+```toml
+[package]
+name = "stump-sync"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+cxx = "1"
+futures-util = "0.3"  # for StreamExt on WebSocket
+
+[build-dependencies]
+cxx-build = "1"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level = "z"   # minimize binary size
+lto = true        # link-time optimization
+strip = true      # strip debug symbols
+```
+
+**`build.rs`:**
+
+```rust
+fn main() {
+    cxx_build::bridge("src/lib.rs")
+        .flag_if_supported("-std=c++17")
+        .compile("stump_sync_cxx");
+}
 ```
 
 ---
