@@ -10,8 +10,14 @@ pub struct Config {
 
 #[derive(Debug, Clone)]
 pub struct LibraryConfig {
+    /// YACReader's numeric library id (the legacy id used in `/v2/library/<id>/`
+    /// URLs and carried by the `comicUpdated` signal). Used to resolve which
+    /// library a per-comic push belongs to.
+    pub yac_library_id: i64,
     pub ydb_path: String,
     pub library_root: String,
+    /// Stump library id. Empty means "auto-discover at init".
     pub stump_library_id: String,
+    /// Stump library filesystem path. Empty means "auto-discover at init".
     pub stump_library_path: String,
 }

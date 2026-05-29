@@ -2,7 +2,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::time::Duration;
 
-use crate::types::{StumpMedia, SyncError};
+use crate::types::{StumpLibrary, StumpMedia, SyncError};
 
 pub struct StumpClient {
     client: reqwest::Client,
@@ -29,27 +29,23 @@ struct GraphQLError {
 }
 
 #[derive(Deserialize)]
-struct LibrariesData {
-    libraries: LibrariesPayload,
+struct LibrariesListData {
+    libraries: PaginatedLibraries,
 }
 
 #[derive(Deserialize)]
-struct LibrariesPayload {
-    nodes: Vec<LibraryNode>,
+struct PaginatedLibraries {
+    nodes: Vec<StumpLibrary>,
 }
 
 #[derive(Deserialize)]
-struct LibraryNode {
-    series: SeriesPayload,
+struct LibraryByIdData {
+    #[serde(rename = "libraryById")]
+    library_by_id: Option<LibraryMediaPayload>,
 }
 
 #[derive(Deserialize)]
-struct SeriesPayload {
-    nodes: Vec<SeriesNode>,
-}
-
-#[derive(Deserialize)]
-struct SeriesNode {
+struct LibraryMediaPayload {
     media: Vec<StumpMedia>,
 }
 
@@ -96,31 +92,52 @@ impl StumpClient {
         })
     }
 
+    /// List all Stump libraries (id, name, path). Used to auto-discover the
+    /// YAC↔Stump library mapping when no explicit override is configured.
+    pub async fn list_libraries(&self) -> Result<Vec<StumpLibrary>, SyncError> {
+        let query = r#"
+            query ListLibraries {
+                libraries(
+                    orderBy: [{ field: NAME, direction: ASC }]
+                    pagination: { offset: { page: 1, pageSize: 200, zeroBased: false } }
+                ) {
+                    nodes {
+                        id
+                        name
+                        path
+                    }
+                }
+            }
+        "#;
+
+        let data: LibrariesListData = self
+            .graphql_request(query, serde_json::Value::Null)
+            .await?;
+        Ok(data.libraries.nodes)
+    }
+
     pub async fn get_library_media(
         &self,
         library_id: &str,
     ) -> Result<Vec<StumpMedia>, SyncError> {
+        // Target the specific library directly via `libraryById` (the root
+        // `libraries(filters: ...)` form used previously is not valid against
+        // the real Stump schema — it only ever passed the wiremock mock).
         let query = r#"
             query GetLibraryMedia($libraryId: ID!) {
-                libraries(filters: { id: $libraryId }) {
-                    nodes {
-                        series {
-                            nodes {
-                                media {
-                                    id
-                                    name
-                                    pages
-                                    path
-                                    readProgresses {
-                                        page
-                                        percentageCompleted
-                                        isCompleted
-                                        epubCfi
-                                        completedAt
-                                        updatedAt
-                                    }
-                                }
-                            }
+                libraryById(id: $libraryId) {
+                    media {
+                        id
+                        name
+                        pages
+                        path
+                        readProgresses {
+                            page
+                            percentageCompleted
+                            isCompleted
+                            epubCfi
+                            completedAt
+                            updatedAt
                         }
                     }
                 }
@@ -131,15 +148,8 @@ impl StumpClient {
             "libraryId": library_id
         });
 
-        let data: LibrariesData = self.graphql_request(query, variables).await?;
-
-        let mut all_media = Vec::new();
-        for library in data.libraries.nodes {
-            for series in library.series.nodes {
-                all_media.extend(series.media);
-            }
-        }
-        Ok(all_media)
+        let data: LibraryByIdData = self.graphql_request(query, variables).await?;
+        Ok(data.library_by_id.map(|l| l.media).unwrap_or_default())
     }
 
     pub async fn update_progress(
@@ -155,11 +165,13 @@ impl StumpClient {
             }
         "#;
 
+        // H5: do NOT send `isCompleted` on a pure page push — sending
+        // `isCompleted: false` would un-complete a comic Stump already considers
+        // finished. Completion is handled separately via `mark_complete`.
         let variables = serde_json::json!({
             "input": {
                 "mediaId": media_id,
-                "page": page,
-                "isCompleted": false
+                "page": page
             }
         });
 
@@ -400,5 +412,99 @@ mod tests {
             }
             other => panic!("expected GraphQL error, got: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_list_libraries_parses_nodes() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("ListLibraries"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "libraries": {
+                        "nodes": [
+                            { "id": "lib-1", "name": "Comics", "path": "/srv/comics" },
+                            { "id": "lib-2", "name": "Manga", "path": "/srv/manga/" }
+                        ]
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = setup_client(&server).await;
+        let libs = client.list_libraries().await.unwrap();
+        assert_eq!(libs.len(), 2);
+        assert_eq!(libs[0].id, "lib-1");
+        assert_eq!(libs[0].name, "Comics");
+        assert_eq!(libs[0].path, "/srv/comics");
+        assert_eq!(libs[1].id, "lib-2");
+        assert_eq!(libs[1].path, "/srv/manga/");
+    }
+
+    #[tokio::test]
+    async fn test_get_library_media_parses_library_by_id() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("GetLibraryMedia"))
+            .and(body_string_contains("\"libraryId\":\"lib-1\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "libraryById": {
+                        "media": [
+                            {
+                                "id": "media-1",
+                                "name": "001.cbz",
+                                "pages": 20,
+                                "path": "/srv/comics/001.cbz",
+                                "readProgresses": [
+                                    {
+                                        "page": 5,
+                                        "percentage_completed": 25.0,
+                                        "is_completed": false,
+                                        "epubCfi": null,
+                                        "completedAt": null,
+                                        "updatedAt": null
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = setup_client(&server).await;
+        let media = client.get_library_media("lib-1").await.unwrap();
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].id, "media-1");
+        assert_eq!(media[0].current_page(), 5);
+        assert!(!media[0].is_complete());
+    }
+
+    #[tokio::test]
+    async fn test_get_library_media_null_library_is_empty() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("GetLibraryMedia"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "libraryById": null }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = setup_client(&server).await;
+        let media = client.get_library_media("missing").await.unwrap();
+        assert!(media.is_empty());
     }
 }

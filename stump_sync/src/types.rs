@@ -1,25 +1,49 @@
 use serde::Deserialize;
 use std::fmt;
 
+/// Progress to push toward Stump. Page and completion are independent
+/// dimensions, so either, both, or neither may be present.
 #[derive(Debug, Clone, PartialEq)]
-pub enum SyncDirection {
-    PushToStump,
-    PullToYac,
-    NoChange,
+pub struct PushAction {
+    /// New page to send to Stump (None = leave Stump's page unchanged).
+    pub page: Option<i32>,
+    /// Mark the comic complete on Stump.
+    pub mark_complete: bool,
 }
 
+/// Progress to pull toward YACReader. Page and completion are independent
+/// dimensions, so either, both, or neither may be present.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PullAction {
+    /// New page to write into the .ydb (None = leave YAC's page unchanged).
+    pub page: Option<i32>,
+    /// Request the YAC `read` flag to be set. The .ydb writer never *clears*
+    /// an existing read=1, so this only ever raises the flag.
+    pub set_read: bool,
+    /// lastTimeOpened to record alongside the pull, if a source time is known.
+    pub last_opened: Option<i64>,
+}
+
+/// The reconciliation result for a single comic. A comic may need BOTH a push
+/// and a pull at once (e.g. YAC ahead on page while Stump holds completion),
+/// so push and pull are fully independent.
 #[derive(Debug, Clone)]
 pub struct BidirectionalDelta {
-    pub direction: SyncDirection,
     pub comic_info_id: i64,
     pub stump_media_id: String,
     pub ydb_path: String,
     pub num_pages: i32,
-    pub push_page: Option<i32>,
-    pub push_mark_complete: bool,
-    pub pull_page: Option<i32>,
-    pub pull_read: bool,
-    pub pull_last_opened: Option<i64>,
+    pub push: Option<PushAction>,
+    pub pull: Option<PullAction>,
+}
+
+/// A Stump library as returned by the root `libraries` query. Used for
+/// auto-discovery of the YAC↔Stump library mapping.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StumpLibrary {
+    pub id: String,
+    pub name: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone)]

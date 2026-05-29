@@ -5,20 +5,31 @@ pub mod stump_client;
 pub mod sync_engine;
 pub mod types;
 
-#[cfg(feature = "ffi")]
 use std::sync::Mutex;
 
-#[cfg(feature = "ffi")]
 use config::{Config, LibraryConfig};
-#[cfg(feature = "ffi")]
 use runtime::SyncRuntime;
 
-#[cfg(feature = "ffi")]
 static RUNTIME: Mutex<Option<SyncRuntime>> = Mutex::new(None);
 
-#[cfg(feature = "ffi")]
+// NOTE: the cxx bridge is intentionally NOT behind `#[cfg(feature = "ffi")]`.
+// The `cxxbridge` CLI used by `corrosion_add_cxxbridge` parses this file without
+// any Cargo features, so a feature-gated bridge would be skipped and generate an
+// empty header. `cxx` is a normal dependency, so the bridge always compiles; the
+// `ffi` feature only gates the standalone C++ glue compile in build.rs.
 #[cxx::bridge(namespace = "stump_sync")]
 mod ffi {
+    /// One YAC↔Stump library mapping. Empty `stump_library_id` /
+    /// `stump_library_path` mean "auto-discover this library at init".
+    #[derive(Debug)]
+    struct LibraryEntry {
+        yac_library_id: i64,
+        ydb_path: String,
+        library_root: String,
+        stump_library_id: String,
+        stump_library_path: String,
+    }
+
     #[derive(Debug)]
     struct SyncConfig {
         stump_url: String,
@@ -26,10 +37,7 @@ mod ffi {
         user_id: String,
         mapping_db_path: String,
         sync_interval_secs: u64,
-        ydb_paths: Vec<String>,
-        library_roots: Vec<String>,
-        stump_library_ids: Vec<String>,
-        stump_library_paths: Vec<String>,
+        libraries: Vec<LibraryEntry>,
     }
 
     #[derive(Debug)]
@@ -56,7 +64,6 @@ mod ffi {
     }
 }
 
-#[cfg(feature = "ffi")]
 fn make_ok() -> ffi::SyncResult {
     ffi::SyncResult {
         success: true,
@@ -64,7 +71,6 @@ fn make_ok() -> ffi::SyncResult {
     }
 }
 
-#[cfg(feature = "ffi")]
 fn make_err(msg: String) -> ffi::SyncResult {
     ffi::SyncResult {
         success: false,
@@ -72,28 +78,23 @@ fn make_err(msg: String) -> ffi::SyncResult {
     }
 }
 
-#[cfg(feature = "ffi")]
-fn rust_sync_init(config: &ffi::SyncConfig) -> ffi::SyncResult {
-    if config.ydb_paths.len() != config.library_roots.len()
-        || config.ydb_paths.len() != config.stump_library_ids.len()
-        || config.ydb_paths.len() != config.stump_library_paths.len()
-    {
-        return make_err("library config vectors must have equal length".into());
-    }
-
-    let libraries: Vec<LibraryConfig> = config
-        .ydb_paths
+fn library_configs_from_ffi(entries: &[ffi::LibraryEntry]) -> Vec<LibraryConfig> {
+    entries
         .iter()
-        .zip(config.library_roots.iter())
-        .zip(config.stump_library_ids.iter())
-        .zip(config.stump_library_paths.iter())
-        .map(|(((ydb, root), sid), spath)| LibraryConfig {
-            ydb_path: ydb.clone(),
-            library_root: root.clone(),
-            stump_library_id: sid.clone(),
-            stump_library_path: spath.clone(),
+        .map(|e| LibraryConfig {
+            yac_library_id: e.yac_library_id,
+            ydb_path: e.ydb_path.clone(),
+            library_root: e.library_root.clone(),
+            stump_library_id: e.stump_library_id.clone(),
+            stump_library_path: e.stump_library_path.clone(),
         })
-        .collect();
+        .collect()
+}
+
+fn rust_sync_init(config: &ffi::SyncConfig) -> ffi::SyncResult {
+    // Per-entry config: each library carries its own ids/paths (no parallel
+    // vectors, no equal-length check). Empty stump_* fields are auto-discovered.
+    let libraries = library_configs_from_ffi(&config.libraries);
 
     let internal_config = Config {
         stump_url: config.stump_url.clone(),
@@ -118,7 +119,6 @@ fn rust_sync_init(config: &ffi::SyncConfig) -> ffi::SyncResult {
     }
 }
 
-#[cfg(feature = "ffi")]
 fn rust_sync_push_progress(library_id: i64, comic_id: i64) -> ffi::SyncResult {
     let guard = match RUNTIME.lock() {
         Ok(g) => g,
@@ -137,7 +137,6 @@ fn rust_sync_push_progress(library_id: i64, comic_id: i64) -> ffi::SyncResult {
     }
 }
 
-#[cfg(feature = "ffi")]
 fn rust_sync_push_all() -> ffi::SyncResult {
     let guard = match RUNTIME.lock() {
         Ok(g) => g,
@@ -153,7 +152,6 @@ fn rust_sync_push_all() -> ffi::SyncResult {
     }
 }
 
-#[cfg(feature = "ffi")]
 fn rust_sync_pull_all() -> ffi::SyncResult {
     let guard = match RUNTIME.lock() {
         Ok(g) => g,
@@ -169,7 +167,6 @@ fn rust_sync_pull_all() -> ffi::SyncResult {
     }
 }
 
-#[cfg(feature = "ffi")]
 fn rust_sync_sync_all() -> ffi::SyncResult {
     let guard = match RUNTIME.lock() {
         Ok(g) => g,
@@ -185,7 +182,6 @@ fn rust_sync_sync_all() -> ffi::SyncResult {
     }
 }
 
-#[cfg(feature = "ffi")]
 fn rust_sync_shutdown() -> ffi::SyncResult {
     let mut guard = match RUNTIME.lock() {
         Ok(g) => g,
@@ -204,7 +200,6 @@ fn rust_sync_shutdown() -> ffi::SyncResult {
     }
 }
 
-#[cfg(feature = "ffi")]
 fn rust_sync_status() -> ffi::SyncStatus {
     let guard = match RUNTIME.lock() {
         Ok(g) => g,
@@ -231,5 +226,47 @@ fn rust_sync_status() -> ffi::SyncStatus {
             last_error: String::new(),
             synced_count: 0,
         },
+    }
+}
+
+#[cfg(test)]
+mod ffi_tests {
+    use super::*;
+
+    #[test]
+    fn test_library_configs_from_ffi_per_entry() {
+        // Per-entry mapping: an explicit library and an auto-discover library
+        // (empty stump_* fields) are both carried through without any
+        // equal-length constraint.
+        let entries = vec![
+            ffi::LibraryEntry {
+                yac_library_id: 7,
+                ydb_path: "/a/.yacreaderlibrary/library.ydb".into(),
+                library_root: "/a".into(),
+                stump_library_id: "stump-a".into(),
+                stump_library_path: "/srv/a".into(),
+            },
+            ffi::LibraryEntry {
+                yac_library_id: 8,
+                ydb_path: "/b/.yacreaderlibrary/library.ydb".into(),
+                library_root: "/b".into(),
+                stump_library_id: String::new(),
+                stump_library_path: String::new(),
+            },
+        ];
+
+        let configs = library_configs_from_ffi(&entries);
+        assert_eq!(configs.len(), 2);
+
+        assert_eq!(configs[0].yac_library_id, 7);
+        assert_eq!(configs[0].ydb_path, "/a/.yacreaderlibrary/library.ydb");
+        assert_eq!(configs[0].stump_library_id, "stump-a");
+        assert_eq!(configs[0].stump_library_path, "/srv/a");
+
+        assert_eq!(configs[1].yac_library_id, 8);
+        assert!(
+            configs[1].stump_library_id.is_empty(),
+            "empty stump id marks this entry for auto-discovery"
+        );
     }
 }

@@ -1,14 +1,23 @@
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::OpenFlags;
+use rusqlite::{OpenFlags, OptionalExtension};
 
 use crate::config::LibraryConfig;
 use crate::mapping_db::MappingDb;
 use crate::stump_client::StumpClient;
 use crate::types::{
-    BidirectionalDelta, ComicProgress, StumpMedia, SyncDelta, SyncDirection, SyncError, SyncReport,
+    BidirectionalDelta, ComicProgress, PullAction, PushAction, StumpLibrary, StumpMedia, SyncDelta,
+    SyncError, SyncReport,
 };
+
+/// Current wall-clock time in epoch seconds (0 on the impossible pre-epoch case).
+fn now_epoch_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 pub struct SyncEngine {
     client: StumpClient,
@@ -29,26 +38,35 @@ impl SyncEngine {
         }
     }
 
+    /// Find the configured library for a YACReader numeric library id (the id
+    /// carried by `comicUpdated` / used in `/v2/library/<id>/`).
+    fn get_library_config_by_id(&self, yac_library_id: i64) -> Option<&LibraryConfig> {
+        self.libraries
+            .iter()
+            .find(|l| l.yac_library_id == yac_library_id)
+    }
+
     pub async fn push_single(
         &self,
         library_id: i64,
         comic_id: i64,
     ) -> Result<(), SyncError> {
+        // H2: resolve the library by its stable YACReader id. The previous code
+        // matched on `ensure_library_mapping(...)`'s autoincrement rowid inside a
+        // `find()` predicate, which is a different id space (it mutated + swallowed
+        // errors and only coincided by luck for a single library).
         let lib_config = self
-            .libraries
-            .iter()
-            .find(|l| {
-                self.mapping_db
-                    .ensure_library_mapping(
-                        &l.ydb_path,
-                        &l.stump_library_id,
-                        &l.stump_library_path,
-                    )
-                    .ok()
-                    == Some(library_id)
-            })
-            .ok_or_else(|| SyncError::Config(format!("library mapping {library_id} not found")))?
+            .get_library_config_by_id(library_id)
+            .ok_or_else(|| {
+                SyncError::Config(format!("no library config for yac_library_id {library_id}"))
+            })?
             .clone();
+
+        let lib_mapping_id = self.mapping_db.ensure_library_mapping(
+            &lib_config.ydb_path,
+            &lib_config.stump_library_id,
+            &lib_config.stump_library_path,
+        )?;
 
         let comics = read_yac_comics(&lib_config.ydb_path)?;
         let comic = comics
@@ -62,7 +80,7 @@ impl SyncEngine {
             Some(id) => id,
             None => {
                 tracing::info!(comic_id, "no mapping found, building mappings");
-                self.build_mappings(&lib_config, library_id).await?;
+                self.build_mappings(&lib_config, lib_mapping_id).await?;
                 self.mapping_db
                     .get_stump_id(comic.comic_info_id)?
                     .ok_or_else(|| {
@@ -332,14 +350,15 @@ impl SyncEngine {
             let delta =
                 compute_bidirectional_delta(comic, media, &lib_config.ydb_path);
 
-            match delta.direction {
-                SyncDirection::PushToStump if !pull_only => {
-                    self.apply_push_delta(&delta, report).await;
+            // Push and pull are independent: a single comic may need both (e.g.
+            // YAC ahead on page while Stump holds completion).
+            if !pull_only {
+                if let Some(push) = &delta.push {
+                    self.apply_push_delta(&delta, push, report).await;
                 }
-                SyncDirection::PullToYac => {
-                    self.apply_pull_delta(&delta, comic.current_page, report);
-                }
-                _ => {}
+            }
+            if let Some(pull) = &delta.pull {
+                self.apply_pull_delta(&delta, pull, comic.current_page, report);
             }
 
             if let Some(&mapping_id) = mapping_by_comic.get(&comic.comic_info_id) {
@@ -358,8 +377,13 @@ impl SyncEngine {
         Ok(())
     }
 
-    async fn apply_push_delta(&self, delta: &BidirectionalDelta, report: &mut SyncReport) {
-        if let Some(page) = delta.push_page {
+    async fn apply_push_delta(
+        &self,
+        delta: &BidirectionalDelta,
+        push: &PushAction,
+        report: &mut SyncReport,
+    ) {
+        if let Some(page) = push.page {
             tracing::info!(media_id = %delta.stump_media_id, page, "pushing page progress");
             if let Err(e) = self.client.update_progress(&delta.stump_media_id, page).await {
                 tracing::warn!(media_id = %delta.stump_media_id, error = %e, "failed to push page");
@@ -368,7 +392,7 @@ impl SyncEngine {
             }
             report.pages_pushed += 1;
         }
-        if delta.push_mark_complete {
+        if push.mark_complete {
             tracing::info!(media_id = %delta.stump_media_id, "marking complete on Stump");
             if let Err(e) = self.client.mark_complete(&delta.stump_media_id, true).await {
                 tracing::warn!(media_id = %delta.stump_media_id, error = %e, "failed to push completion");
@@ -382,15 +406,16 @@ impl SyncEngine {
     fn apply_pull_delta(
         &self,
         delta: &BidirectionalDelta,
+        pull: &PullAction,
         current_yac_page: i32,
         report: &mut SyncReport,
     ) {
-        let page = delta.pull_page.unwrap_or(current_yac_page);
-        let has_page_change = delta.pull_page.is_some();
+        let page = pull.page.unwrap_or(current_yac_page);
+        let has_page_change = pull.page.is_some();
         tracing::info!(
             comic_info_id = delta.comic_info_id,
             page,
-            read = delta.pull_read,
+            read = pull.set_read,
             "pulling progress to YAC"
         );
         match write_yac_progress(
@@ -398,14 +423,14 @@ impl SyncEngine {
             delta.comic_info_id,
             page,
             delta.num_pages,
-            delta.pull_read,
-            delta.pull_last_opened,
+            pull.set_read,
+            pull.last_opened,
         ) {
             Ok(()) => {
                 if has_page_change {
                     report.pages_pulled += 1;
                 }
-                if delta.pull_read {
+                if pull.set_read {
                     report.completions_pulled += 1;
                 }
             }
@@ -439,6 +464,9 @@ impl SyncEngine {
 
 pub fn read_yac_comics(ydb_path: &str) -> Result<Vec<ComicProgress>, SyncError> {
     let conn = rusqlite::Connection::open_with_flags(ydb_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    // H3: the live server may hold the rollback-journal lock; wait rather than
+    // failing immediately with SQLITE_BUSY (which would abort the library sync).
+    conn.busy_timeout(Duration::from_millis(5000))?;
 
     let mut stmt = conn.prepare(
         "SELECT ci.id, c.id, ci.currentPage, ci.numPages, ci.read, ci.hasBeenOpened, ci.lastTimeOpened, ci.hash, c.path, c.fileName
@@ -510,6 +538,110 @@ pub fn match_comics<'a>(
     matches
 }
 
+/// Normalize a filesystem path for comparison: trim a single trailing '/'
+/// (without turning a bare "/" into the empty string).
+pub fn normalize_fs_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() && !path.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Match a configured YACReader library to a Stump library by normalized
+/// filesystem path, falling back to an exact name match (the YAC library's
+/// folder name against the Stump library's name or path basename).
+pub fn match_stump_library<'a>(
+    yac: &LibraryConfig,
+    stump_libs: &'a [StumpLibrary],
+) -> Option<&'a StumpLibrary> {
+    let yac_root = normalize_fs_path(&yac.library_root);
+
+    // 1. Exact normalized full-path match (most precise).
+    if let Some(found) = stump_libs
+        .iter()
+        .find(|s| normalize_fs_path(&s.path) == yac_root)
+    {
+        return Some(found);
+    }
+
+    // 2. Fallback: the YAC library folder name vs a Stump library's name or its
+    //    path basename. Paths differ across machines, so a name match is often
+    //    the only signal available.
+    let yac_name = yac_root.rsplit('/').next().unwrap_or("");
+    if !yac_name.is_empty() {
+        if let Some(found) = stump_libs.iter().find(|s| {
+            s.name == yac_name
+                || normalize_fs_path(&s.path).rsplit('/').next() == Some(yac_name)
+        }) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+/// Resolve the Stump id/path for any library configured for auto-discovery
+/// (empty `stump_library_id`). Libraries with explicit overrides are kept as-is.
+/// Auto-discoverable libraries that can't be matched are logged and dropped so a
+/// single unmatched library never fails the whole init. If listing Stump
+/// libraries fails entirely, only the explicitly-configured libraries are kept.
+pub async fn resolve_library_configs(
+    client: &StumpClient,
+    libraries: Vec<LibraryConfig>,
+) -> Vec<LibraryConfig> {
+    let needs_discovery = libraries.iter().any(|l| l.stump_library_id.is_empty());
+    if !needs_discovery {
+        return libraries;
+    }
+
+    let stump_libs = match client.list_libraries().await {
+        Ok(libs) => libs,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to list Stump libraries for auto-discovery; keeping only \
+                 explicitly-configured libraries"
+            );
+            return libraries
+                .into_iter()
+                .filter(|l| !l.stump_library_id.is_empty())
+                .collect();
+        }
+    };
+
+    let mut resolved = Vec::new();
+    for mut lib in libraries {
+        if !lib.stump_library_id.is_empty() {
+            resolved.push(lib);
+            continue;
+        }
+        match match_stump_library(&lib, &stump_libs) {
+            Some(stump_lib) => {
+                lib.stump_library_id = stump_lib.id.clone();
+                lib.stump_library_path = stump_lib.path.clone();
+                tracing::info!(
+                    yac_library_id = lib.yac_library_id,
+                    library_root = %lib.library_root,
+                    stump_library_id = %lib.stump_library_id,
+                    stump_library_path = %lib.stump_library_path,
+                    "auto-discovered Stump library"
+                );
+                resolved.push(lib);
+            }
+            None => {
+                tracing::warn!(
+                    yac_library_id = lib.yac_library_id,
+                    library_root = %lib.library_root,
+                    "no matching Stump library found for auto-discovery; skipping"
+                );
+            }
+        }
+    }
+    resolved
+}
+
 pub fn compute_delta(yac: &ComicProgress, stump: &StumpMedia) -> Option<SyncDelta> {
     let stump_page = stump.current_page();
     let stump_complete = stump.is_complete();
@@ -534,6 +666,8 @@ pub fn compute_delta(yac: &ComicProgress, stump: &StumpMedia) -> Option<SyncDelt
 
 pub fn read_all_yac_comics(ydb_path: &str) -> Result<Vec<ComicProgress>, SyncError> {
     let conn = rusqlite::Connection::open_with_flags(ydb_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    // H3: see read_yac_comics — wait out the live server's lock instead of aborting.
+    conn.busy_timeout(Duration::from_millis(5000))?;
 
     let mut stmt = conn.prepare(
         "SELECT ci.id, c.id, ci.currentPage, ci.numPages, ci.read, ci.hasBeenOpened, ci.lastTimeOpened, ci.hash, c.path, c.fileName
@@ -565,6 +699,14 @@ pub fn read_all_yac_comics(ydb_path: &str) -> Result<Vec<ComicProgress>, SyncErr
     Ok(comics)
 }
 
+/// Apply pulled progress to the YACReader `.ydb` using a read-modify-write so
+/// progress is monotonic and lossless (fixes C2/H4):
+///   * `currentPage` never regresses (`max(existing, incoming)`),
+///   * an existing `read = 1` is never cleared,
+///   * `hasBeenOpened` is sticky once set,
+///   * `lastTimeOpened` only advances.
+/// A `busy_timeout` is set (H3) so a lock held by the live server is waited out
+/// rather than failing immediately. The UPDATE is skipped when nothing changed.
 pub fn write_yac_progress(
     ydb_path: &str,
     comic_info_id: i64,
@@ -577,40 +719,94 @@ pub fn write_yac_progress(
         ydb_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE,
     )?;
+    // H3: wait for the live server's whole-file (rollback-journal) lock.
+    conn.busy_timeout(Duration::from_millis(5000))?;
 
-    let has_been_opened: i32 = if page > 0 { 1 } else { 0 };
-    let is_read: i32 = if read || (num_pages > 0 && page >= num_pages) {
-        1
+    // Read the current row first; the row must already exist.
+    let existing: Option<(i32, bool, bool, Option<i64>, i32)> = conn
+        .query_row(
+            "SELECT currentPage, read, hasBeenOpened, lastTimeOpened, numPages FROM comic_info WHERE id = ?1",
+            rusqlite::params![comic_info_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i32>>(0)?.unwrap_or(0),
+                    row.get::<_, Option<i32>>(1)?.unwrap_or(0) != 0,
+                    row.get::<_, Option<i32>>(2)?.unwrap_or(0) != 0,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i32>>(4)?.unwrap_or(0),
+                ))
+            },
+        )
+        .optional()?;
+
+    let (existing_page, existing_read, existing_hbo, existing_lto, existing_num_pages) =
+        match existing {
+            Some(row) => row,
+            None => {
+                return Err(SyncError::Database(format!(
+                    "comic_info_id {comic_info_id} not found in {ydb_path}"
+                )))
+            }
+        };
+
+    // The live row's numPages is authoritative; fall back to the caller's value.
+    let effective_num_pages = if existing_num_pages > 0 {
+        existing_num_pages
     } else {
-        0
+        num_pages
     };
-    let timestamp = last_time_opened.unwrap_or_else(|| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-    });
 
-    let updated = conn.execute(
-        "UPDATE comic_info SET currentPage = ?1, read = ?2, hasBeenOpened = ?3, lastTimeOpened = ?4 WHERE id = ?5",
-        rusqlite::params![page, is_read, has_been_opened, timestamp, comic_info_id],
-    )?;
+    // Page never regresses.
+    let new_page = existing_page.max(page);
+    // Completion is monotonic: never clear an existing read flag.
+    let new_read =
+        existing_read || read || (effective_num_pages > 0 && new_page >= effective_num_pages);
+    // hasBeenOpened is sticky once set.
+    let new_hbo = existing_hbo || new_page > 0 || new_read;
 
-    if updated == 0 {
-        return Err(SyncError::Database(format!(
-            "comic_info_id {comic_info_id} not found in {ydb_path}"
-        )));
+    let content_changed =
+        new_page != existing_page || new_read != existing_read || new_hbo != existing_hbo;
+
+    // lastTimeOpened only advances. Avoid synthesizing "now" (and the resulting
+    // write churn) when nothing else changed.
+    let candidate_ts = match last_time_opened {
+        Some(ts) => Some(ts),
+        None if content_changed => Some(now_epoch_secs()),
+        None => None,
+    };
+    let new_lto = match (existing_lto, candidate_ts) {
+        (Some(e), Some(c)) => Some(e.max(c)),
+        (Some(e), None) => Some(e),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    };
+
+    if !content_changed && new_lto == existing_lto {
+        tracing::debug!(comic_info_id, "no .ydb change needed; skipping update");
+        return Ok(());
     }
+
+    conn.execute(
+        "UPDATE comic_info SET currentPage = ?1, read = ?2, hasBeenOpened = ?3, lastTimeOpened = ?4 WHERE id = ?5",
+        rusqlite::params![new_page, new_read as i32, new_hbo as i32, new_lto, comic_info_id],
+    )?;
 
     tracing::debug!(
         comic_info_id,
-        page,
-        read = is_read,
+        page = new_page,
+        read = new_read as i32,
         "wrote progress to .ydb"
     );
     Ok(())
 }
 
+/// Reconcile one comic across YACReader and Stump, resolving page and completion
+/// as INDEPENDENT dimensions (fixes C2/H4):
+///   * `final_page     = max(yac.current_page, stump_page)`
+///   * `final_complete = yac.read || stump.is_complete()`  (monotonic)
+/// Stump is pushed to whenever it is behind on either dimension; YACReader is
+/// pulled to whenever it is behind on either dimension. A single comic can
+/// therefore require both a push and a pull at once.
 pub fn compute_bidirectional_delta(
     yac: &ComicProgress,
     stump: &StumpMedia,
@@ -619,56 +815,61 @@ pub fn compute_bidirectional_delta(
     let stump_page = stump.current_page();
     let stump_complete = stump.is_complete();
 
-    let yac_page_ahead = yac.current_page > stump_page;
-    let stump_page_ahead = stump_page > yac.current_page;
+    let final_page = yac.current_page.max(stump_page);
+    let final_complete = yac.read || stump_complete;
 
-    let yac_has_completion = yac.read && !stump_complete;
-    let stump_has_completion = stump_complete && !yac.read;
+    // Push to Stump when Stump is behind on page and/or completion.
+    let push_page = if stump_page < final_page {
+        Some(final_page)
+    } else {
+        None
+    };
+    let push_mark_complete = final_complete && !stump_complete;
+    let push = if push_page.is_some() || push_mark_complete {
+        Some(PushAction {
+            page: push_page,
+            mark_complete: push_mark_complete,
+        })
+    } else {
+        None
+    };
 
-    let mut delta = BidirectionalDelta {
-        direction: SyncDirection::NoChange,
+    // Pull to YAC when YAC is behind on page and/or completion.
+    let pull_page = if yac.current_page < final_page {
+        Some(final_page)
+    } else {
+        None
+    };
+    let set_read = final_complete && !yac.read;
+    // When pulling a Stump-side completion, record a completion time if Stump
+    // reports one.
+    let last_opened = if set_read && stump_complete {
+        stump
+            .read_progresses
+            .first()
+            .and_then(|rp| rp.completed_at.as_ref())
+            .map(|_| now_epoch_secs())
+    } else {
+        None
+    };
+    let pull = if pull_page.is_some() || set_read {
+        Some(PullAction {
+            page: pull_page,
+            set_read,
+            last_opened,
+        })
+    } else {
+        None
+    };
+
+    BidirectionalDelta {
         comic_info_id: yac.comic_info_id,
         stump_media_id: stump.id.clone(),
         ydb_path: ydb_path.to_string(),
         num_pages: yac.num_pages,
-        push_page: None,
-        push_mark_complete: false,
-        pull_page: None,
-        pull_read: false,
-        pull_last_opened: None,
-    };
-
-    if yac_page_ahead {
-        delta.direction = SyncDirection::PushToStump;
-        delta.push_page = Some(yac.current_page);
-        if yac_has_completion {
-            delta.push_mark_complete = true;
-        }
-    } else if stump_page_ahead {
-        delta.direction = SyncDirection::PullToYac;
-        delta.pull_page = Some(stump_page);
-        if stump_has_completion {
-            delta.pull_read = true;
-        }
-    } else if yac_has_completion {
-        delta.direction = SyncDirection::PushToStump;
-        delta.push_mark_complete = true;
-    } else if stump_has_completion {
-        delta.direction = SyncDirection::PullToYac;
-        delta.pull_read = true;
-        delta.pull_last_opened = stump
-            .read_progresses
-            .first()
-            .and_then(|rp| rp.completed_at.as_ref())
-            .and_then(|_| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .ok()
-                    .map(|d| d.as_secs() as i64)
-            });
+        push,
+        pull,
     }
-
-    delta
 }
 
 #[cfg(test)]
@@ -787,6 +988,129 @@ mod tests {
         assert_eq!(matches.len(), 1);
     }
 
+    fn make_lib_config(yac_library_id: i64, library_root: &str) -> LibraryConfig {
+        LibraryConfig {
+            yac_library_id,
+            ydb_path: format!("{library_root}/.yacreaderlibrary/library.ydb"),
+            library_root: library_root.to_string(),
+            stump_library_id: String::new(),
+            stump_library_path: String::new(),
+        }
+    }
+
+    fn make_stump_library(id: &str, name: &str, path: &str) -> StumpLibrary {
+        StumpLibrary {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_normalize_fs_path() {
+        assert_eq!(normalize_fs_path("/srv/comics/"), "/srv/comics");
+        assert_eq!(normalize_fs_path("/srv/comics"), "/srv/comics");
+        assert_eq!(normalize_fs_path("/srv/comics///"), "/srv/comics");
+        assert_eq!(normalize_fs_path("/"), "/");
+        assert_eq!(normalize_fs_path(""), "");
+    }
+
+    #[test]
+    fn test_match_stump_library_by_path() {
+        let yac = make_lib_config(1, "/srv/comics/"); // trailing slash differs
+        let libs = vec![
+            make_stump_library("lib-1", "Comics", "/srv/comics"),
+            make_stump_library("lib-2", "Manga", "/srv/manga"),
+        ];
+        let found = match_stump_library(&yac, &libs).expect("expected a path match");
+        assert_eq!(found.id, "lib-1");
+    }
+
+    #[test]
+    fn test_match_stump_library_by_name_fallback() {
+        // Paths differ across machines; fall back to the folder name.
+        let yac = make_lib_config(1, "/Users/me/Comics");
+        let libs = vec![
+            make_stump_library("lib-1", "Manga", "/srv/manga"),
+            make_stump_library("lib-2", "Comics", "/srv/data/Comics"),
+        ];
+        let found = match_stump_library(&yac, &libs).expect("expected a name fallback match");
+        assert_eq!(found.id, "lib-2");
+    }
+
+    #[test]
+    fn test_match_stump_library_none() {
+        let yac = make_lib_config(1, "/Users/me/Nope");
+        let libs = vec![make_stump_library("lib-1", "Comics", "/srv/comics")];
+        assert!(match_stump_library(&yac, &libs).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_library_configs_auto_and_override() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("ListLibraries"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "libraries": { "nodes": [
+                    { "id": "stump-comics", "name": "Comics", "path": "/srv/comics" },
+                    { "id": "stump-manga", "name": "Manga", "path": "/srv/manga" }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = StumpClient::new(server.uri(), "k".into(), "u".into()).unwrap();
+
+        let libraries = vec![
+            // (1) auto-discover by path
+            make_lib_config(1, "/srv/comics"),
+            // (2) explicit override is honored verbatim (no discovery)
+            LibraryConfig {
+                yac_library_id: 2,
+                ydb_path: "/b/.ydb".into(),
+                library_root: "/whatever".into(),
+                stump_library_id: "manual-id".into(),
+                stump_library_path: "/manual/path".into(),
+            },
+            // (3) auto-discover with no possible match → dropped, not fatal
+            make_lib_config(3, "/no/match/here"),
+        ];
+
+        let resolved = resolve_library_configs(&client, libraries).await;
+        assert_eq!(resolved.len(), 2, "unmatched auto-discover library is dropped");
+
+        let lib1 = resolved.iter().find(|l| l.yac_library_id == 1).unwrap();
+        assert_eq!(lib1.stump_library_id, "stump-comics");
+        assert_eq!(lib1.stump_library_path, "/srv/comics");
+
+        let lib2 = resolved.iter().find(|l| l.yac_library_id == 2).unwrap();
+        assert_eq!(lib2.stump_library_id, "manual-id", "override preserved");
+        assert_eq!(lib2.stump_library_path, "/manual/path");
+
+        assert!(resolved.iter().all(|l| l.yac_library_id != 3));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_library_configs_skips_network_when_all_explicit() {
+        // No library needs discovery → list_libraries is never called, so a
+        // server that would fail the call is irrelevant.
+        let client = StumpClient::new("http://127.0.0.1:1".into(), "k".into(), "u".into()).unwrap();
+        let libraries = vec![LibraryConfig {
+            yac_library_id: 1,
+            ydb_path: "/a/.ydb".into(),
+            library_root: "/srv/comics".into(),
+            stump_library_id: "explicit".into(),
+            stump_library_path: "/srv/comics".into(),
+        }];
+        let resolved = resolve_library_configs(&client, libraries).await;
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].stump_library_id, "explicit");
+    }
+
     #[test]
     fn test_delta_yac_ahead() {
         let comic = make_comic(1, "test.cbz", 10, false);
@@ -867,10 +1191,10 @@ mod tests {
         let media = make_stump_media("sm-1", "/comics/test.cbz", 5, false);
 
         let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
-        assert_eq!(delta.direction, SyncDirection::PushToStump);
-        assert_eq!(delta.push_page, Some(15));
-        assert!(!delta.push_mark_complete);
-        assert!(delta.pull_page.is_none());
+        let push = delta.push.expect("expected a push");
+        assert_eq!(push.page, Some(15));
+        assert!(!push.mark_complete);
+        assert!(delta.pull.is_none());
     }
 
     #[test]
@@ -879,10 +1203,10 @@ mod tests {
         let media = make_stump_media("sm-1", "/comics/test.cbz", 15, false);
 
         let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
-        assert_eq!(delta.direction, SyncDirection::PullToYac);
-        assert_eq!(delta.pull_page, Some(15));
-        assert!(!delta.pull_read);
-        assert!(delta.push_page.is_none());
+        let pull = delta.pull.expect("expected a pull");
+        assert_eq!(pull.page, Some(15));
+        assert!(!pull.set_read);
+        assert!(delta.push.is_none());
     }
 
     #[test]
@@ -891,7 +1215,8 @@ mod tests {
         let media = make_stump_media("sm-1", "/comics/test.cbz", 10, false);
 
         let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
-        assert_eq!(delta.direction, SyncDirection::NoChange);
+        assert!(delta.push.is_none());
+        assert!(delta.pull.is_none());
     }
 
     #[test]
@@ -900,9 +1225,11 @@ mod tests {
         let media = make_stump_media("sm-1", "/comics/test.cbz", 20, false);
 
         let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
-        assert_eq!(delta.direction, SyncDirection::PushToStump);
-        assert!(delta.push_mark_complete);
-        assert!(delta.push_page.is_none());
+        let push = delta.push.expect("expected a push");
+        assert!(push.mark_complete);
+        assert!(push.page.is_none());
+        // YAC is already read, so nothing to pull.
+        assert!(delta.pull.is_none());
     }
 
     #[test]
@@ -911,9 +1238,11 @@ mod tests {
         let media = make_stump_media("sm-1", "/comics/test.cbz", 20, true);
 
         let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
-        assert_eq!(delta.direction, SyncDirection::PullToYac);
-        assert!(delta.pull_read);
-        assert!(delta.pull_page.is_none());
+        let pull = delta.pull.expect("expected a pull");
+        assert!(pull.set_read);
+        assert!(pull.page.is_none());
+        // Stump is already complete, so nothing to push.
+        assert!(delta.push.is_none());
     }
 
     #[test]
@@ -922,7 +1251,8 @@ mod tests {
         let media = make_stump_media("sm-1", "/comics/test.cbz", 20, true);
 
         let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
-        assert_eq!(delta.direction, SyncDirection::NoChange);
+        assert!(delta.push.is_none());
+        assert!(delta.pull.is_none());
     }
 
     #[test]
@@ -931,9 +1261,10 @@ mod tests {
         let media = make_stump_media("sm-1", "/comics/test.cbz", 10, false);
 
         let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
-        assert_eq!(delta.direction, SyncDirection::PushToStump);
-        assert_eq!(delta.push_page, Some(20));
-        assert!(delta.push_mark_complete);
+        let push = delta.push.expect("expected a push");
+        assert_eq!(push.page, Some(20));
+        assert!(push.mark_complete);
+        assert!(delta.pull.is_none());
     }
 
     #[test]
@@ -942,21 +1273,30 @@ mod tests {
         let media = make_stump_media("sm-1", "/comics/test.cbz", 18, true);
 
         let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
-        assert_eq!(delta.direction, SyncDirection::PullToYac);
-        assert_eq!(delta.pull_page, Some(18));
-        assert!(delta.pull_read);
+        let pull = delta.pull.expect("expected a pull");
+        assert_eq!(pull.page, Some(18));
+        assert!(pull.set_read);
+        assert!(delta.push.is_none());
     }
 
     #[test]
-    fn test_compute_bidirectional_page_priority_over_completion() {
-        // YAC has higher page, Stump has completion — page wins (PushToStump)
+    fn test_compute_bidirectional_independent_page_and_completion() {
+        // YAC is ahead on page; Stump holds completion. The OLD code chose a
+        // single direction "by page", so Stump's completion was never pulled to
+        // YAC. With independent dimensions, the page is pushed to Stump AND the
+        // completion is pulled to YAC.
         let comic = make_comic(1, "test.cbz", 18, false);
         let media = make_stump_media("sm-1", "/comics/test.cbz", 10, true);
 
         let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
-        assert_eq!(delta.direction, SyncDirection::PushToStump);
-        assert_eq!(delta.push_page, Some(18));
-        assert!(!delta.push_mark_complete);
+
+        let push = delta.push.expect("expected a push (page to Stump)");
+        assert_eq!(push.page, Some(18));
+        assert!(!push.mark_complete, "Stump is already complete");
+
+        let pull = delta.pull.expect("expected a pull (completion to YAC)");
+        assert!(pull.set_read, "Stump's completion must propagate to YAC");
+        assert!(pull.page.is_none(), "YAC is already page-ahead");
     }
 
     #[test]
@@ -1060,5 +1400,100 @@ mod tests {
 
         let result = write_yac_progress(path, 999, 5, 20, false, None);
         assert!(result.is_err());
+    }
+
+    /// Create a one-row `.ydb` for write tests and return its path-keeping temp file.
+    fn ydb_with_comic(
+        current_page: i32,
+        num_pages: i32,
+        read: i32,
+        has_been_opened: i32,
+    ) -> tempfile::NamedTempFile {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE comic_info (
+                id INTEGER PRIMARY KEY,
+                currentPage INTEGER DEFAULT 0,
+                numPages INTEGER DEFAULT 20,
+                read INTEGER DEFAULT 0,
+                hasBeenOpened INTEGER DEFAULT 0,
+                lastTimeOpened INTEGER,
+                hash TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO comic_info (id, currentPage, numPages, read, hasBeenOpened) VALUES (1, ?1, ?2, ?3, ?4)",
+            rusqlite::params![current_page, num_pages, read, has_been_opened],
+        )
+        .unwrap();
+        drop(conn);
+        tmp
+    }
+
+    fn read_row(path: &str) -> (i32, i32, i32) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.query_row(
+            "SELECT currentPage, read, hasBeenOpened FROM comic_info WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    /// Regression for C2: pulling a page from Stump (which is not complete) must
+    /// never clear an existing YAC `read = 1`. The OLD blind-overwrite set read=0.
+    #[test]
+    fn test_no_read_flag_wipe_on_pull() {
+        // YAC: read=1, currentPage=5. Stump: page=10, not complete, numPages=20.
+        let tmp = ydb_with_comic(5, 20, 1, 1);
+        let path = tmp.path().to_str().unwrap();
+
+        // The pull action for this scenario is page=10, set_read=false.
+        write_yac_progress(path, 1, 10, 20, false, None).unwrap();
+
+        let (page, read, _opened) = read_row(path);
+        assert_eq!(page, 10, "page should advance to Stump's page");
+        assert_eq!(read, 1, "existing read flag must be preserved (C2 regression)");
+    }
+
+    /// Completion converges in both directions regardless of which side is
+    /// page-ahead (C2/H4): the side lacking completion receives it.
+    #[test]
+    fn test_completion_converges_both_ways() {
+        // Case A: Stump complete but page-behind YAC. YAC must end read=1, and
+        // Stump's page catches up (it is already complete, so no re-mark).
+        let comic = make_comic(1, "test.cbz", 20, false);
+        let media = make_stump_media("sm-1", "/comics/test.cbz", 10, true);
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        let pull = delta.pull.expect("case A: expected a pull");
+        assert!(pull.set_read, "case A: YAC must become read");
+        let push = delta.push.expect("case A: expected a page push");
+        assert_eq!(push.page, Some(20), "case A: Stump page catches up");
+        assert!(!push.mark_complete, "case A: Stump already complete");
+
+        // Mirror case B: YAC complete (read=1) but page-behind Stump. Stump must
+        // get mark_complete, and applying the pull preserves YAC's read flag
+        // while advancing its page.
+        let comic = make_comic(1, "test.cbz", 5, true);
+        let media = make_stump_media("sm-1", "/comics/test.cbz", 10, false);
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        let push = delta.push.expect("case B: expected a push");
+        assert!(push.mark_complete, "case B: Stump must be marked complete");
+        let pull = delta.pull.expect("case B: expected a page pull");
+        assert_eq!(pull.page, Some(10), "case B: YAC page catches up");
+        assert!(!pull.set_read, "case B: YAC already read");
+
+        // Apply case B's pull to a real .ydb row (read=1, page=5) and confirm
+        // the read flag survives and the page advances.
+        let tmp = ydb_with_comic(5, 20, 1, 1);
+        let path = tmp.path().to_str().unwrap();
+        let page = pull.page.unwrap_or(comic.current_page);
+        write_yac_progress(path, comic.comic_info_id, page, comic.num_pages, pull.set_read, pull.last_opened)
+            .unwrap();
+        let (page, read, _opened) = read_row(path);
+        assert_eq!(page, 10);
+        assert_eq!(read, 1, "case B: YAC read flag preserved");
     }
 }

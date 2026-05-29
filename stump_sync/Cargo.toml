@@ -5,7 +5,13 @@ edition = "2021"
 
 [features]
 default = []
-ffi = ["dep:cxx"]
+# `ffi` gates the cxx bridge module (lib.rs) and the build.rs cxx glue compile.
+# `cxx` itself is a normal (non-optional) dependency: corrosion_add_cxxbridge
+# discovers the required cxxbridge version via `cargo tree -i cxx` (run without
+# features), so an optional/feature-gated cxx would be invisible to it and the
+# CMake build would fail. This crate is built as part of a C++ application, so a
+# C++ toolchain is always available.
+ffi = []
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -15,7 +21,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
-cxx = { version = "1", optional = true }
+cxx = "1"
 
 [dev-dependencies]
 tempfile = "3"

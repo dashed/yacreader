@@ -60,6 +60,7 @@ async fn test_push_single_comic_progress() {
 
     let mapping_db_path = dir.path().join("mappings.db");
     let lib_config = LibraryConfig {
+        yac_library_id: 1,
         ydb_path: ydb_path.to_str().unwrap().to_string(),
         library_root: dir.path().to_str().unwrap().to_string(),
         stump_library_id: "lib-1".into(),
@@ -135,6 +136,7 @@ async fn test_push_all_multiple_comics() {
 
     let mapping_db_path = dir.path().join("mappings.db");
     let lib_config = LibraryConfig {
+        yac_library_id: 1,
         ydb_path: ydb_path.to_str().unwrap().to_string(),
         library_root: dir.path().to_str().unwrap().to_string(),
         stump_library_id: "lib-1".into(),
@@ -196,6 +198,7 @@ async fn test_no_sync_when_stump_ahead() {
 
     let mapping_db_path = dir.path().join("mappings.db");
     let lib_config = LibraryConfig {
+        yac_library_id: 1,
         ydb_path: ydb_path.to_str().unwrap().to_string(),
         library_root: dir.path().to_str().unwrap().to_string(),
         stump_library_id: "lib-1".into(),
@@ -270,6 +273,7 @@ async fn test_path_matching_across_systems() {
 
     let mapping_db_path = dir.path().join("mappings.db");
     let lib_config = LibraryConfig {
+        yac_library_id: 1,
         ydb_path: ydb_path.to_str().unwrap().to_string(),
         library_root: dir.path().to_str().unwrap().to_string(),
         stump_library_id: "lib-1".into(),
@@ -326,6 +330,7 @@ async fn test_unmatched_comics_skipped() {
 
     let mapping_db_path = dir.path().join("mappings.db");
     let lib_config = LibraryConfig {
+        yac_library_id: 1,
         ydb_path: ydb_path.to_str().unwrap().to_string(),
         library_root: dir.path().to_str().unwrap().to_string(),
         stump_library_id: "lib-1".into(),

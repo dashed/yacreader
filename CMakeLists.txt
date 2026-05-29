@@ -159,7 +159,23 @@ if(ENABLE_STUMP_SYNC)
         GIT_TAG v0.5.1
     )
     FetchContent_MakeAvailable(Corrosion)
+
+    # Import the Rust staticlib (with the ffi feature). The CMake target name is
+    # the Cargo lib name: `stump_sync` (underscores), not the package name.
     corrosion_import_crate(MANIFEST_PATH ${CMAKE_SOURCE_DIR}/stump_sync/Cargo.toml FEATURES ffi)
+
+    # The crate's build.rs also knows how to compile the cxx C++ glue (for
+    # standalone `cargo test --features ffi`). Tell it to skip that here so the
+    # bridge is produced solely by corrosion_add_cxxbridge below — otherwise the
+    # cxx shim symbols would be defined twice and fail to link.
+    corrosion_set_env_vars(stump_sync "STUMP_SYNC_SKIP_CXX_BUILD=1")
+
+    # Generate + compile the cxx bridge into target `stump_sync_bridge`. FILES is
+    # resolved relative to the crate's src/ dir, so it is `lib.rs` (not
+    # src/lib.rs). The generated header is included as "stump_sync_bridge/lib.h"
+    # (the cxxbridge CLI names it lib.h via NAME_WE). This also sets up the
+    # include dir and links the glue against the Rust crate.
+    corrosion_add_cxxbridge(stump_sync_bridge CRATE stump_sync FILES lib.rs)
 endif()
 
 # PDF backend detection (creates pdf_backend_iface INTERFACE target)

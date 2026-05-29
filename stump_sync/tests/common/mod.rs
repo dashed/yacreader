@@ -130,14 +130,8 @@ fn build_media_response_json(media_list: &[MockMedia]) -> serde_json::Value {
 
     json!({
         "data": {
-            "libraries": {
-                "nodes": [{
-                    "series": {
-                        "nodes": [{
-                            "media": media_json
-                        }]
-                    }
-                }]
+            "libraryById": {
+                "media": media_json
             }
         }
     })

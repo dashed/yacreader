@@ -61,7 +61,11 @@ target_link_libraries(YACReaderLibraryServer PRIVATE
 
 # Stump reading progress sync (Rust crate via cxx)
 if(ENABLE_STUMP_SYNC)
-    target_link_libraries(YACReaderLibraryServer PRIVATE stump-sync)
+    # stump_sync_bridge (from corrosion_add_cxxbridge) carries the generated
+    # cxx header include dir, the compiled C++ glue, and transitively the Rust
+    # staticlib (stump-sync). Linking it is what makes
+    # `#include "stump_sync_bridge/src/lib.h"` resolve and the symbols link.
+    target_link_libraries(YACReaderLibraryServer PRIVATE stump_sync_bridge)
     target_compile_definitions(YACReaderLibraryServer PRIVATE ENABLE_STUMP_SYNC)
     if(APPLE)
         target_link_libraries(YACReaderLibraryServer PRIVATE

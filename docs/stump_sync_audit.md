@@ -151,3 +151,24 @@ The doc claims "latest timestamp wins (LWW)" and a timestamp-threshold re-read d
 3. **H3** — `busy_timeout` on `.ydb` connections.
 4. **H5, H6, M-series** — correctness/robustness and doc reconciliation.
 5. Backfill the **FFI/init + concurrency + data-loss** tests so the suite actually covers the integration.
+
+---
+
+## Addendum (2026-05-29) — fixes landed + a newly discovered Critical the audit missed
+
+**Fixed and verified on `feat/stump-sync-phase2` (not yet pushed):**
+- **C2 + H4 + H3 + minimal H5** — `compute_bidirectional_delta` now resolves page and completion as independent dimensions (`final_page = max`, `final_complete = yac.read || stump.complete`, monotonic); `write_yac_progress` is read-modify-write and **never clears `read=1`**, never regresses the page, sets `busy_timeout(5s)` (H3), and skips no-op writes; `update_progress` no longer sends `isCompleted:false` (H5-min). Regression tests `test_no_read_flag_wipe_on_pull` + `test_completion_converges_both_ways` added (fail on old code). Lead-verified by tracing the wipe scenario through the new code.
+- **C1 + H1 + H2** — config reshaped to per-library `LibraryEntry{yac_library_id, ydb_path, library_root, optional stump overrides}`; auto-discovery via new `StumpClient::list_libraries()` + `resolve_library_configs()` (match by path → name/basename fallback, honor overrides, log+drop unmatched, never fail init); `push_single` resolves by `yac_library_id` (H2 — no more mapping-DB-rowid comparison, no mutation/error-swallow in a predicate); C++ fills `yac_library_id = lib.getLegacyId()`. **H1 build** fixed with `corrosion_add_cxxbridge` (+ four sub-fixes: correct target name `stump_sync`, header include `"stump_sync_bridge/lib.h"`, non-optional `cxx`, `STUMP_SYNC_SKIP_CXX_BUILD` to avoid double-compiling the glue). Bridge wiring validated via a standalone harness (full Qt6 build not possible in this env). **68 tests pass** with default features *and* `--features ffi`.
+- Tradeoff introduced: `cxx` is now a non-optional dependency, so the default `cargo build`/`cargo test` now require a C++ toolchain (previously C++-free). Net positive for coverage (the bridge compiles in CI now), but a change worth noting.
+
+### C3 — Critical (NEW): the Stump GraphQL client targets a non-existent schema
+**Confidence: High (verified against `stump/crates/graphql/schema.graphql`).** Discovered while wiring auto-discovery against the real schema. The original audit checked for GraphQL *injection* but never validated query/mutation **shapes** against the real schema — this is an audit gap. Even with C1 and C2 fixed, the integration **cannot work against a real Stump server**:
+
+| Client uses | Reality (schema) |
+|-------------|------------------|
+| `Media { readProgresses { page, isCompleted, completedAt, … } }` | `Media.readProgress: ActiveReadingSession` (singular, line 1375) + `Media.readHistory: [FinishedReadingSession!]!`. No `readProgresses`. |
+| `updateMediaProgress(input: UpdateMediaProgress!)` | `updateMediaProgress(id: ID!, input: MediaProgressInput!): ReadingProgressOutput!` (line 1884). `MediaProgressInput` is a `@oneOf` of `paged`/`epub`. |
+| `putMediaCompletion(id, isCompleted)` | **No such mutation.** Real one is `markMediaAsComplete(id: ID!, isComplete: Boolean!, page: Int)`. |
+| `ActiveReadingSession { isCompleted, completedAt }` | `ActiveReadingSession` has no completion flag; completion = presence of a `FinishedReadingSession` in `readHistory`. |
+
+These passed CI only because every test uses wiremock mocks / hand-built `StumpMedia`. **Fix is sizeable** and overlaps C2's completion model: rework `StumpMedia`/`ReadProgress` to the real `readProgress` + `readHistory` shape, derive `is_complete` from `readHistory`, rewrite `update_progress` to `updateMediaProgress(id, {paged:{page}})`, replace `putMediaCompletion` with `markMediaAsComplete`, and update the conflict-resolution truth table + all mock fixtures accordingly. Recommend a dedicated task; consider validating against a real Stump instance (or generating types from the live schema) so this class of drift can't recur.

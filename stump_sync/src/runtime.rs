@@ -48,13 +48,21 @@ impl SyncRuntime {
 
         let mapping_db = MappingDb::open(&config.mapping_db_path)?;
         let poll_interval_secs = config.sync_interval_secs;
-        let engine = SyncEngine::new(client, mapping_db, config.libraries);
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .map_err(|e| SyncError::Config(format!("failed to create tokio runtime: {e}")))?;
+
+        // Resolve auto-discovered libraries (those configured without an explicit
+        // Stump id/path) up front, on the runtime. Unmatched libraries are
+        // dropped with a warning rather than failing init.
+        let libraries = runtime.block_on(crate::sync_engine::resolve_library_configs(
+            &client,
+            config.libraries,
+        ));
+        let engine = SyncEngine::new(client, mapping_db, libraries);
 
         let (tx, rx) = mpsc::unbounded_channel();
         let status = Arc::new(Mutex::new(SyncStatusInfo {

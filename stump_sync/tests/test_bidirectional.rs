@@ -55,6 +55,7 @@ async fn test_pull_when_stump_ahead() {
 
     let mapping_db_path = dir.path().join("mappings.db");
     let lib_config = LibraryConfig {
+        yac_library_id: 1,
         ydb_path: ydb_path.to_str().unwrap().to_string(),
         library_root: dir.path().to_str().unwrap().to_string(),
         stump_library_id: "lib-1".into(),
@@ -127,6 +128,7 @@ async fn test_bidirectional_mixed() {
 
     let mapping_db_path = dir.path().join("mappings.db");
     let lib_config = LibraryConfig {
+        yac_library_id: 1,
         ydb_path: ydb_path.to_str().unwrap().to_string(),
         library_root: dir.path().to_str().unwrap().to_string(),
         stump_library_id: "lib-1".into(),
@@ -185,6 +187,7 @@ async fn test_conflict_resolution_max_page() {
 
     let mapping_db_path = dir.path().join("mappings.db");
     let lib_config = LibraryConfig {
+        yac_library_id: 1,
         ydb_path: ydb_path.to_str().unwrap().to_string(),
         library_root: dir.path().to_str().unwrap().to_string(),
         stump_library_id: "lib-1".into(),
@@ -237,6 +240,7 @@ async fn test_completion_stump_to_yac() {
 
     let mapping_db_path = dir.path().join("mappings.db");
     let lib_config = LibraryConfig {
+        yac_library_id: 1,
         ydb_path: ydb_path.to_str().unwrap().to_string(),
         library_root: dir.path().to_str().unwrap().to_string(),
         stump_library_id: "lib-1".into(),
@@ -285,6 +289,7 @@ async fn test_sync_state_tracking() {
     let mapping_db_path = dir.path().join("mappings.db");
     let mapping_db_str = mapping_db_path.to_str().unwrap().to_string();
     let lib_config = LibraryConfig {
+        yac_library_id: 1,
         ydb_path: ydb_str.clone(),
         library_root: dir.path().to_str().unwrap().to_string(),
         stump_library_id: "lib-1".into(),
@@ -341,6 +346,7 @@ async fn test_push_still_works() {
 
     let mapping_db_path = dir.path().join("mappings.db");
     let lib_config = LibraryConfig {
+        yac_library_id: 1,
         ydb_path: ydb_path.to_str().unwrap().to_string(),
         library_root: dir.path().to_str().unwrap().to_string(),
         stump_library_id: "lib-1".into(),
