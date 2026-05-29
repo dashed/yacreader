@@ -91,29 +91,23 @@ pub fn insert_comic(
     .unwrap();
 }
 
-fn build_media_response_json(media_list: &[MockMedia]) -> serde_json::Value {
+/// Build the real `libraryById { media { ... readProgress readHistory } }`
+/// response shape. `read_page` → the nullable singular `readProgress` object;
+/// `is_complete` → a one-entry `readHistory` (presence == completed). The two
+/// are independent: a completed comic may have `readProgress = null`.
+pub fn build_media_response_json(media_list: &[MockMedia]) -> serde_json::Value {
     let media_json: Vec<serde_json::Value> = media_list
         .iter()
         .map(|m| {
-            let read_progresses = if let Some(page) = m.read_page {
-                let pct = if m.is_complete {
-                    100.0
-                } else {
-                    (page as f64 / m.pages as f64) * 100.0
-                };
-                let completed_at = if m.is_complete {
-                    json!("2024-01-01")
-                } else {
-                    json!(null)
-                };
-                json!([{
+            let read_progress = match m.read_page {
+                Some(page) => json!({
                     "page": page,
-                    "percentage_completed": pct,
-                    "is_completed": m.is_complete,
-                    "epubCfi": null,
-                    "completedAt": completed_at,
-                    "updatedAt": null
-                }])
+                    "updatedAt": "2026-05-20T14:32:10Z"
+                }),
+                None => json!(null),
+            };
+            let read_history = if m.is_complete {
+                json!([{ "completedAt": "2026-05-19T09:01:00Z" }])
             } else {
                 json!([])
             };
@@ -123,7 +117,8 @@ fn build_media_response_json(media_list: &[MockMedia]) -> serde_json::Value {
                 "name": m.name,
                 "pages": m.pages,
                 "path": m.path,
-                "readProgresses": read_progresses
+                "readProgress": read_progress,
+                "readHistory": read_history
             })
         })
         .collect();
@@ -131,6 +126,7 @@ fn build_media_response_json(media_list: &[MockMedia]) -> serde_json::Value {
     json!({
         "data": {
             "libraryById": {
+                "id": "lib-1",
                 "media": media_json
             }
         }
@@ -156,6 +152,8 @@ pub async fn mock_update_progress_response(server: &MockServer) {
             ResponseTemplate::new(200).set_body_json(json!({
                 "data": {
                     "updateMediaProgress": {
+                        "__typename": "ActiveReadingSession",
+                        "id": "media",
                         "page": 1
                     }
                 }
@@ -172,8 +170,9 @@ pub async fn mock_mark_complete_response(server: &MockServer) {
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({
                 "data": {
-                    "putMediaCompletion": {
-                        "isCompleted": true
+                    "markMediaAsComplete": {
+                        "id": "media",
+                        "completedAt": "2024-01-01T00:00:00Z"
                     }
                 }
             })),
@@ -224,6 +223,19 @@ pub fn mock_media_stump_complete(id: &str, path: &str, page: i32, total_pages: i
         pages: total_pages,
         path: path.to_string(),
         read_page: Some(page),
+        is_complete: true,
+    }
+}
+
+/// Completed on Stump with NO active reading session: `readProgress = null`,
+/// `readHistory = [entry]`. `current_page()` falls back to `total_pages`.
+pub fn mock_media_completed_no_active(id: &str, path: &str, total_pages: i32) -> MockMedia {
+    MockMedia {
+        id: id.to_string(),
+        name: path.rsplit('/').next().unwrap_or(path).to_string(),
+        pages: total_pages,
+        path: path.to_string(),
+        read_page: None,
         is_complete: true,
     }
 }

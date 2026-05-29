@@ -1,12 +1,31 @@
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use common::*;
 use stump_sync::config::LibraryConfig;
 use stump_sync::mapping_db::MappingDb;
 use stump_sync::stump_client::StumpClient;
 use stump_sync::sync_engine::SyncEngine;
 use tempfile::TempDir;
-use wiremock::MockServer;
+use wiremock::matchers::{body_string_contains, method, path as req_path};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+/// A wiremock responder that returns a different body on each successive call,
+/// clamping to the final entry once the list is exhausted. Used to simulate
+/// Stump's state changing between two `sync_all` fetches.
+struct SequencedResponder {
+    responses: Vec<serde_json::Value>,
+    calls: AtomicUsize,
+}
+
+impl Respond for SequencedResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+        let i = idx.min(self.responses.len() - 1);
+        ResponseTemplate::new(200).set_body_json(self.responses[i].clone())
+    }
+}
 
 fn make_engine(
     server: &MockServer,
@@ -373,4 +392,129 @@ async fn test_push_still_works() {
     assert_eq!(report.pages_pushed, 1);
     assert_eq!(report.pages_pulled, 0);
     assert!(report.errors.is_empty());
+}
+
+/// A comic that is COMPLETE on Stump (readProgress=null, readHistory=[entry])
+/// must pull read=1 and the last page into YAC — and must NOT trigger a
+/// markMediaAsComplete back to Stump (Stump is already complete).
+#[tokio::test]
+async fn test_completed_on_stump_pulls_read() {
+    let dir = TempDir::new().unwrap();
+    let ydb_path = create_test_ydb(dir.path());
+    let conn = open_ydb(&ydb_path);
+    // YAC: page 5/20, not read.
+    insert_comic(&conn, 1, "hash-1", "001.cbz", "Comics", 5, 20, false, 1700000000);
+    drop(conn);
+
+    let server = MockServer::start().await;
+    // Stump: completed with no active session, pages=20.
+    mock_library_media_response(
+        &server,
+        &[mock_media_completed_no_active(
+            "media-1",
+            "/srv/comics/Comics/001.cbz",
+            20,
+        )],
+    )
+    .await;
+
+    let mapping_db_path = dir.path().join("mappings.db");
+    let lib_config = LibraryConfig {
+        yac_library_id: 1,
+        ydb_path: ydb_path.to_str().unwrap().to_string(),
+        library_root: dir.path().to_str().unwrap().to_string(),
+        stump_library_id: "lib-1".into(),
+        stump_library_path: "/srv/comics".into(),
+    };
+    let engine = make_engine(&server, mapping_db_path.to_str().unwrap(), vec![lib_config]);
+
+    let report = engine.sync_all().await.unwrap();
+
+    // YAC pulled to read=1, page advanced to the last page (20).
+    let comic = read_comic_from_ydb(&ydb_path, 1);
+    assert!(comic.read, "Stump completion must pull read=1 into YAC");
+    assert_eq!(comic.current_page, 20);
+
+    // No completion push (Stump already complete) and no page push.
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests_containing(&requests, "MarkComplete").is_empty(),
+        "must NOT re-complete an already-complete Stump comic"
+    );
+    assert!(
+        requests_containing(&requests, "UpdateProgress").is_empty(),
+        "no page push expected (Stump is at/after the final page)"
+    );
+
+    assert_eq!(report.completions_pulled, 1);
+    assert_eq!(report.pages_pulled, 1);
+    assert!(report.errors.is_empty());
+}
+
+/// Idempotency (C3): once we push a completion to Stump, a later sync must NOT
+/// push it again after Stump reports the finished session. markMediaAsComplete
+/// is NOT deduped server-side, so the guard `final_complete && !stump_complete`
+/// is what prevents duplicate history entries.
+#[tokio::test]
+async fn test_complete_pushed_once_not_repeated() {
+    let dir = TempDir::new().unwrap();
+    let ydb_path = create_test_ydb(dir.path());
+    let conn = open_ydb(&ydb_path);
+    // YAC: read=1, page 20/20 (finished locally).
+    insert_comic(&conn, 1, "hash-1", "001.cbz", "Comics", 20, 20, true, 1700000000);
+    drop(conn);
+
+    let server = MockServer::start().await;
+
+    // 1st fetch: Stump in-progress at page 10, history empty (NOT complete).
+    let in_progress = build_media_response_json(&[MockMedia {
+        id: "media-1".into(),
+        name: "001.cbz".into(),
+        pages: 20,
+        path: "/srv/comics/Comics/001.cbz".into(),
+        read_page: Some(10),
+        is_complete: false,
+    }]);
+    // 2nd fetch: Stump now complete (finished session recorded), active cleared.
+    let completed = build_media_response_json(&[mock_media_completed_no_active(
+        "media-1",
+        "/srv/comics/Comics/001.cbz",
+        20,
+    )]);
+
+    Mock::given(method("POST"))
+        .and(req_path("/graphql"))
+        .and(body_string_contains("GetLibraryMedia"))
+        .respond_with(SequencedResponder {
+            responses: vec![in_progress, completed],
+            calls: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+    mock_update_progress_response(&server).await;
+    mock_mark_complete_response(&server).await;
+
+    let mapping_db_path = dir.path().join("mappings.db");
+    let lib_config = LibraryConfig {
+        yac_library_id: 1,
+        ydb_path: ydb_path.to_str().unwrap().to_string(),
+        library_root: dir.path().to_str().unwrap().to_string(),
+        stump_library_id: "lib-1".into(),
+        stump_library_path: "/srv/comics".into(),
+    };
+    let engine = make_engine(&server, mapping_db_path.to_str().unwrap(), vec![lib_config]);
+
+    // First sync: Stump is behind & not complete → push page 20 + markComplete.
+    engine.sync_all().await.unwrap();
+    // Second sync: Stump now reports the finished session → push NOTHING.
+    engine.sync_all().await.unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let completions = requests_containing(&requests, "MarkComplete");
+    assert_eq!(
+        completions.len(),
+        1,
+        "markMediaAsComplete must be sent exactly once across both syncs"
+    );
+    assert!(completions[0].contains("media-1"));
 }

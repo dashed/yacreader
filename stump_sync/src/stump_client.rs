@@ -49,20 +49,78 @@ struct LibraryMediaPayload {
     media: Vec<StumpMedia>,
 }
 
+/// `updateMediaProgress` returns the `MediaProgress` union
+/// (`ActiveReadingSession | FinishedReadingSession`). We treat the push as
+/// fire-and-forget, so we only need the field to exist — its shape is captured
+/// as an opaque value and never inspected.
 #[derive(Debug, Deserialize)]
 struct UpdateProgressData {
     #[serde(rename = "updateMediaProgress")]
     _update_media_progress: serde_json::Value,
 }
 
+/// `markMediaAsComplete` returns a *nullable* `FinishedReadingSession`.
 #[derive(Debug, Deserialize)]
 struct MarkCompleteData {
-    #[serde(rename = "putMediaCompletion")]
-    _put_media_completion: serde_json::Value,
+    #[serde(rename = "markMediaAsComplete")]
+    _mark_media_as_complete: Option<serde_json::Value>,
 }
 
 const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF_MS: u64 = 1000;
+
+/// Fetch every media in a library with the user-scoped active session
+/// (`readProgress`, nullable singular) and finished sessions (`readHistory`).
+/// `Library.media` with no `take` returns ALL media — no pagination needed.
+/// Completion is derived from `readHistory` presence, so we deliberately do NOT
+/// select `percentageCompleted` (async-graphql serializes Decimal as a string).
+const GET_LIBRARY_MEDIA_QUERY: &str = r#"
+    query GetLibraryMedia($libraryId: ID!) {
+        libraryById(id: $libraryId) {
+            id
+            media {
+                id
+                name
+                pages
+                path
+                readProgress {
+                    page
+                    updatedAt
+                }
+                readHistory {
+                    completedAt
+                }
+            }
+        }
+    }
+"#;
+
+/// Push a paged progress update. `MediaProgressInput` is `@oneOf {paged|epub}`;
+/// `PagedProgressInput` is `{ page: Int!, elapsedSeconds: Int }` — there is no
+/// `isComplete` here, so a page push never (un)completes a comic. The return is
+/// the `MediaProgress` union, so the selection needs inline fragments.
+const UPDATE_PROGRESS_MUTATION: &str = r#"
+    mutation UpdateProgress($id: ID!, $page: Int!) {
+        updateMediaProgress(id: $id, input: { paged: { page: $page } }) {
+            __typename
+            ... on ActiveReadingSession { id page }
+            ... on FinishedReadingSession { id completedAt }
+        }
+    }
+"#;
+
+/// Mark a comic complete. `isComplete: true` is hard-coded — we only ever mark
+/// complete, never un-complete. NOTE: Stump does NOT dedupe this server-side
+/// (repeated calls append duplicate history), so callers MUST gate it on
+/// `final_complete && !stump_complete` to stay idempotent.
+const MARK_COMPLETE_MUTATION: &str = r#"
+    mutation MarkComplete($id: ID!) {
+        markMediaAsComplete(id: $id, isComplete: true) {
+            id
+            completedAt
+        }
+    }
+"#;
 
 impl StumpClient {
     pub fn new(base_url: String, api_key: String, user_id: String) -> Result<Self, SyncError> {
@@ -116,88 +174,52 @@ impl StumpClient {
         Ok(data.libraries.nodes)
     }
 
+    /// Fetch all media for a library, with each media's active session
+    /// (`readProgress`) and finished sessions (`readHistory`). Both are
+    /// auto-scoped to the API-key user, so no user filter is needed.
     pub async fn get_library_media(
         &self,
         library_id: &str,
     ) -> Result<Vec<StumpMedia>, SyncError> {
-        // Target the specific library directly via `libraryById` (the root
-        // `libraries(filters: ...)` form used previously is not valid against
-        // the real Stump schema — it only ever passed the wiremock mock).
-        let query = r#"
-            query GetLibraryMedia($libraryId: ID!) {
-                libraryById(id: $libraryId) {
-                    media {
-                        id
-                        name
-                        pages
-                        path
-                        readProgresses {
-                            page
-                            percentageCompleted
-                            isCompleted
-                            epubCfi
-                            completedAt
-                            updatedAt
-                        }
-                    }
-                }
-            }
-        "#;
-
         let variables = serde_json::json!({
             "libraryId": library_id
         });
 
-        let data: LibraryByIdData = self.graphql_request(query, variables).await?;
+        let data: LibraryByIdData = self
+            .graphql_request(GET_LIBRARY_MEDIA_QUERY, variables)
+            .await?;
         Ok(data.library_by_id.map(|l| l.media).unwrap_or_default())
     }
 
+    /// Push a page-progress update to Stump (fire-and-forget, but GraphQL errors
+    /// are surfaced). Completion is never (un)set here — see `mark_complete`.
     pub async fn update_progress(
         &self,
         media_id: &str,
         page: i32,
     ) -> Result<(), SyncError> {
-        let query = r#"
-            mutation UpdateProgress($input: UpdateMediaProgress!) {
-                updateMediaProgress(input: $input) {
-                    page
-                }
-            }
-        "#;
-
-        // H5: do NOT send `isCompleted` on a pure page push — sending
-        // `isCompleted: false` would un-complete a comic Stump already considers
-        // finished. Completion is handled separately via `mark_complete`.
         let variables = serde_json::json!({
-            "input": {
-                "mediaId": media_id,
-                "page": page
-            }
+            "id": media_id,
+            "page": page
         });
 
-        let _: UpdateProgressData = self.graphql_request(query, variables).await?;
+        let _: UpdateProgressData = self
+            .graphql_request(UPDATE_PROGRESS_MUTATION, variables)
+            .await?;
         Ok(())
     }
 
-    pub async fn mark_complete(
-        &self,
-        media_id: &str,
-        is_complete: bool,
-    ) -> Result<(), SyncError> {
-        let query = r#"
-            mutation MarkComplete($mediaId: ID!, $isCompleted: Boolean!) {
-                putMediaCompletion(id: $mediaId, isCompleted: $isCompleted) {
-                    isCompleted
-                }
-            }
-        "#;
-
+    /// Mark a comic complete on Stump (always `isComplete: true`). Callers MUST
+    /// only invoke this when Stump is not already complete (idempotency guard) —
+    /// Stump appends a duplicate finished session on every call.
+    pub async fn mark_complete(&self, media_id: &str) -> Result<(), SyncError> {
         let variables = serde_json::json!({
-            "mediaId": media_id,
-            "isCompleted": is_complete
+            "id": media_id
         });
 
-        let _: MarkCompleteData = self.graphql_request(query, variables).await?;
+        let _: MarkCompleteData = self
+            .graphql_request(MARK_COMPLETE_MUTATION, variables)
+            .await?;
         Ok(())
     }
 
@@ -290,11 +312,13 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/graphql"))
             .and(body_string_contains("updateMediaProgress"))
-            .and(body_string_contains("\"mediaId\":\"media-123\""))
+            .and(body_string_contains("\"id\":\"media-123\""))
             .and(body_string_contains("\"page\":5"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": {
                     "updateMediaProgress": {
+                        "__typename": "ActiveReadingSession",
+                        "id": "media-123",
                         "page": 5
                     }
                 }
@@ -313,13 +337,13 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("putMediaCompletion"))
-            .and(body_string_contains("\"mediaId\":\"media-456\""))
-            .and(body_string_contains("\"isCompleted\":true"))
+            .and(body_string_contains("markMediaAsComplete"))
+            .and(body_string_contains("\"id\":\"media-456\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": {
-                    "putMediaCompletion": {
-                        "isCompleted": true
+                    "markMediaAsComplete": {
+                        "id": "media-456",
+                        "completedAt": "2024-01-01T00:00:00Z"
                     }
                 }
             })))
@@ -328,7 +352,7 @@ mod tests {
             .await;
 
         let client = setup_client(&server).await;
-        client.mark_complete("media-456", true).await.unwrap();
+        client.mark_complete("media-456").await.unwrap();
     }
 
     #[tokio::test]
@@ -456,22 +480,18 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": {
                     "libraryById": {
+                        "id": "lib-1",
                         "media": [
                             {
                                 "id": "media-1",
                                 "name": "001.cbz",
                                 "pages": 20,
                                 "path": "/srv/comics/001.cbz",
-                                "readProgresses": [
-                                    {
-                                        "page": 5,
-                                        "percentage_completed": 25.0,
-                                        "is_completed": false,
-                                        "epubCfi": null,
-                                        "completedAt": null,
-                                        "updatedAt": null
-                                    }
-                                ]
+                                "readProgress": {
+                                    "page": 5,
+                                    "updatedAt": "2026-05-20T14:32:10Z"
+                                },
+                                "readHistory": []
                             }
                         ]
                     }
@@ -487,6 +507,36 @@ mod tests {
         assert_eq!(media[0].id, "media-1");
         assert_eq!(media[0].current_page(), 5);
         assert!(!media[0].is_complete());
+    }
+
+    /// Tripwire: the query/mutation strings must match the REAL Stump schema and
+    /// must never regress to the fictional field/type names that only ever
+    /// satisfied the old wiremock mocks. The forbidden needles are assembled at
+    /// runtime via `concat!` so this guard itself never appears in a schema grep
+    /// over the source.
+    #[test]
+    fn test_queries_match_real_schema() {
+        // Required real-schema tokens.
+        assert!(GET_LIBRARY_MEDIA_QUERY.contains("libraryById"));
+        assert!(GET_LIBRARY_MEDIA_QUERY.contains("readProgress"));
+        assert!(GET_LIBRARY_MEDIA_QUERY.contains("readHistory"));
+        assert!(UPDATE_PROGRESS_MUTATION.contains("updateMediaProgress"));
+        assert!(MARK_COMPLETE_MUTATION.contains("markMediaAsComplete"));
+
+        // Fictional tokens that must NEVER reappear in any query/mutation.
+        let all = format!(
+            "{GET_LIBRARY_MEDIA_QUERY}{UPDATE_PROGRESS_MUTATION}{MARK_COMPLETE_MUTATION}"
+        );
+        for forbidden in [
+            concat!("readPro", "gresses"),
+            concat!("putMedia", "Completion"),
+            concat!("Update", "MediaProgress"),
+        ] {
+            assert!(
+                !all.contains(forbidden),
+                "fictional token `{forbidden}` reappeared in a query/mutation string"
+            );
+        }
     }
 
     #[tokio::test]

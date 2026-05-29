@@ -59,43 +59,63 @@ pub struct ComicProgress {
     pub relative_path: String,
 }
 
+/// A single Stump media (comic) as returned by `libraryById(...).media`.
+///
+/// Completion is NOT a flag on the active session — it is the *presence* of a
+/// `FinishedReadingSession` in `read_history`. The active session (`readProgress`,
+/// singular & nullable) only carries the in-progress page.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StumpMedia {
     pub id: String,
     pub name: String,
     pub pages: i32,
     pub path: String,
-    #[serde(rename = "readProgresses")]
-    pub read_progresses: Vec<ReadProgress>,
+    /// The user's active reading session, or `None` if there is no in-progress
+    /// session (e.g. never opened, or finished and the active session cleared).
+    #[serde(default)]
+    pub read_progress: Option<ActiveReadingSession>,
+    /// Finished reading sessions. A non-empty list means the comic is complete.
+    #[serde(default)]
+    pub read_history: Vec<FinishedReadingSession>,
 }
 
 impl StumpMedia {
+    /// The current page on Stump.
+    ///   * an active session with a real (>= 0) page wins (epub sessions use -1);
+    ///   * otherwise a completed comic sits at its LAST page (`pages`), never 0 —
+    ///     critical so a finished comic isn't treated as "page 0" by conflict
+    ///     resolution;
+    ///   * otherwise 0 (untouched).
     pub fn current_page(&self) -> i32 {
-        self.read_progresses
-            .first()
-            .map(|rp| rp.page)
-            .unwrap_or(0)
+        match self.read_progress.as_ref().and_then(|rp| rp.page) {
+            Some(page) if page >= 0 => page,
+            _ if self.is_complete() => self.pages,
+            _ => 0,
+        }
     }
 
+    /// A comic is complete iff Stump recorded at least one finished session.
     pub fn is_complete(&self) -> bool {
-        self.read_progresses
-            .first()
-            .map(|rp| rp.is_completed)
-            .unwrap_or(false)
+        !self.read_history.is_empty()
     }
 }
 
+/// The user's active (in-progress) reading session for a comic. Singular and
+/// nullable on Stump. `page` is nullable and is -1 for epub sessions.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ReadProgress {
-    pub page: i32,
-    pub percentage_completed: Option<f64>,
-    pub is_completed: bool,
-    #[serde(rename = "epubCfi")]
-    pub epub_cfi: Option<String>,
-    #[serde(rename = "completedAt")]
-    pub completed_at: Option<String>,
-    #[serde(rename = "updatedAt")]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveReadingSession {
+    pub page: Option<i32>,
     pub updated_at: Option<String>,
+}
+
+/// A finished reading session. Its mere presence in `read_history` marks the
+/// comic as complete.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinishedReadingSession {
+    pub completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -230,6 +250,7 @@ mod tests {
         assert!(report.errors.is_empty());
     }
 
+    /// Untouched: no active session, no history → page 0, not complete.
     #[test]
     fn test_stump_media_current_page_empty() {
         let media = StumpMedia {
@@ -237,12 +258,14 @@ mod tests {
             name: "test".into(),
             pages: 20,
             path: "/comics/test.cbz".into(),
-            read_progresses: vec![],
+            read_progress: None,
+            read_history: vec![],
         };
         assert_eq!(media.current_page(), 0);
         assert!(!media.is_complete());
     }
 
+    /// In-progress: active session with a page, no history → that page, not complete.
     #[test]
     fn test_stump_media_current_page_with_progress() {
         let media = StumpMedia {
@@ -250,19 +273,18 @@ mod tests {
             name: "test".into(),
             pages: 20,
             path: "/comics/test.cbz".into(),
-            read_progresses: vec![ReadProgress {
-                page: 10,
-                percentage_completed: Some(50.0),
-                is_completed: false,
-                epub_cfi: None,
-                completed_at: None,
-                updated_at: None,
-            }],
+            read_progress: Some(ActiveReadingSession {
+                page: Some(10),
+                updated_at: Some("2026-05-20T14:32:10Z".into()),
+            }),
+            read_history: vec![],
         };
         assert_eq!(media.current_page(), 10);
         assert!(!media.is_complete());
     }
 
+    /// Re-reading: an active session AND a finished session. The active page wins
+    /// for `current_page`, and the comic is still considered complete.
     #[test]
     fn test_stump_media_is_complete() {
         let media = StumpMedia {
@@ -270,13 +292,31 @@ mod tests {
             name: "test".into(),
             pages: 20,
             path: "/comics/test.cbz".into(),
-            read_progresses: vec![ReadProgress {
-                page: 20,
-                percentage_completed: Some(100.0),
-                is_completed: true,
-                epub_cfi: None,
-                completed_at: Some("2024-01-01".into()),
+            read_progress: Some(ActiveReadingSession {
+                page: Some(8),
                 updated_at: None,
+            }),
+            read_history: vec![FinishedReadingSession {
+                completed_at: Some("2024-01-01".into()),
+            }],
+        };
+        assert_eq!(media.current_page(), 8);
+        assert!(media.is_complete());
+    }
+
+    /// Completed with NO active session: `current_page` falls back to the last
+    /// page (`pages`), NOT 0, so conflict resolution never sees a finished comic
+    /// as "page 0".
+    #[test]
+    fn test_current_page_completed_no_active() {
+        let media = StumpMedia {
+            id: "id1".into(),
+            name: "test".into(),
+            pages: 20,
+            path: "/comics/test.cbz".into(),
+            read_progress: None,
+            read_history: vec![FinishedReadingSession {
+                completed_at: Some("2026-05-19T09:01:00Z".into()),
             }],
         };
         assert_eq!(media.current_page(), 20);

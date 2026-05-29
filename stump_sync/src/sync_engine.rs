@@ -394,7 +394,7 @@ impl SyncEngine {
         }
         if push.mark_complete {
             tracing::info!(media_id = %delta.stump_media_id, "marking complete on Stump");
-            if let Err(e) = self.client.mark_complete(&delta.stump_media_id, true).await {
+            if let Err(e) = self.client.mark_complete(&delta.stump_media_id).await {
                 tracing::warn!(media_id = %delta.stump_media_id, error = %e, "failed to push completion");
                 report.errors.push(format!("{}: {e}", delta.stump_media_id));
                 return;
@@ -454,7 +454,7 @@ impl SyncEngine {
         if delta.should_mark_complete {
             tracing::info!(media_id = %delta.stump_media_id, "marking complete");
             self.client
-                .mark_complete(&delta.stump_media_id, true)
+                .mark_complete(&delta.stump_media_id)
                 .await?;
         }
 
@@ -842,12 +842,13 @@ pub fn compute_bidirectional_delta(
     };
     let set_read = final_complete && !yac.read;
     // When pulling a Stump-side completion, record a completion time if Stump
-    // reports one.
+    // reports one. Completion lives in read_history now; stump_complete implies
+    // it is non-empty.
     let last_opened = if set_read && stump_complete {
         stump
-            .read_progresses
+            .read_history
             .first()
-            .and_then(|rp| rp.completed_at.as_ref())
+            .and_then(|fs| fs.completed_at.as_ref())
             .map(|_| now_epoch_secs())
     } else {
         None
@@ -875,7 +876,7 @@ pub fn compute_bidirectional_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ReadProgress;
+    use crate::types::{ActiveReadingSession, FinishedReadingSession};
 
     #[test]
     fn test_normalize_path_with_dir() {
@@ -912,24 +913,27 @@ mod tests {
         }
     }
 
+    /// Build a `StumpMedia` with an active session at `page` and, when
+    /// `complete`, a single finished session (completion = presence in
+    /// `read_history`). The active session is always present so `current_page()`
+    /// reflects `page` (these tests assert exact pages on both sides).
     fn make_stump_media(id: &str, path: &str, page: i32, complete: bool) -> StumpMedia {
         StumpMedia {
             id: id.to_string(),
             name: "test".into(),
             pages: 20,
             path: path.to_string(),
-            read_progresses: vec![ReadProgress {
-                page,
-                percentage_completed: Some(if complete { 100.0 } else { (page as f64 / 20.0) * 100.0 }),
-                is_completed: complete,
-                epub_cfi: None,
-                completed_at: if complete {
-                    Some("2024-01-01".into())
-                } else {
-                    None
-                },
+            read_progress: Some(ActiveReadingSession {
+                page: Some(page),
                 updated_at: None,
-            }],
+            }),
+            read_history: if complete {
+                vec![FinishedReadingSession {
+                    completed_at: Some("2024-01-01".into()),
+                }]
+            } else {
+                vec![]
+            },
         }
     }
 
@@ -1177,7 +1181,8 @@ mod tests {
             name: "test".into(),
             pages: 20,
             path: "/comics/test.cbz".into(),
-            read_progresses: vec![],
+            read_progress: None,
+            read_history: vec![],
         };
 
         let delta = compute_delta(&comic, &media).unwrap();
