@@ -331,11 +331,24 @@ async fn test_sync_state_tracking() {
         .get_sync_state(mappings[0].id)
         .unwrap()
         .expect("sync_state should exist after sync_all");
-    // sync_state records pre-pull YAC page and the Stump page at sync time
-    assert_eq!(state.yac_current_page, 5);
+    // M2/H6: sync_state now records the CONVERGED page/read (the same value on
+    // both sides — here max(5, 10) = 10) plus the per-side SOURCE timestamps
+    // observed at this sync (previously these were pre-sync per-side values and
+    // the timestamps were always NULL).
+    assert_eq!(state.yac_current_page, 10);
     assert_eq!(state.stump_current_page, 10);
     assert!(!state.yac_read);
     assert!(!state.stump_complete);
+    assert_eq!(
+        state.yac_last_modified.as_deref(),
+        Some("1700000000"),
+        "YAC lastTimeOpened recorded as the source timestamp"
+    );
+    assert_eq!(
+        state.stump_last_modified.as_deref(),
+        Some("2026-05-20T14:32:10Z"),
+        "Stump readProgress.updatedAt recorded as the source timestamp"
+    );
 }
 
 #[tokio::test]

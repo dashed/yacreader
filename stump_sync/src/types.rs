@@ -17,9 +17,16 @@ pub struct PushAction {
 pub struct PullAction {
     /// New page to write into the .ydb (None = leave YAC's page unchanged).
     pub page: Option<i32>,
-    /// Request the YAC `read` flag to be set. The .ydb writer never *clears*
-    /// an existing read=1, so this only ever raises the flag.
+    /// In a normal (monotonic) pull this REQUESTS raising the YAC `read` flag to
+    /// true and is ignored when false (the writer never clears an existing
+    /// read=1). In a validated regression pull (`allow_regression = true`) this
+    /// is the EXACT desired `read` value, so `false` clears it.
     pub set_read: bool,
+    /// Permit the .ydb writer to LOWER the page and/or CLEAR `read` — the single
+    /// path allowed to bypass the C2 monotonic write-guard. Set true ONLY for a
+    /// validated, same-side, timestamp-checked Stump→YAC re-read / unread (H6);
+    /// every other pull keeps this false so C2 safety holds.
+    pub allow_regression: bool,
     /// lastTimeOpened to record alongside the pull, if a source time is known.
     pub last_opened: Option<i64>,
 }
@@ -35,6 +42,14 @@ pub struct BidirectionalDelta {
     pub num_pages: i32,
     pub push: Option<PushAction>,
     pub pull: Option<PullAction>,
+    /// The converged page both sides should hold after this sync. Recorded into
+    /// `sync_state` as the next baseline (H6/M2). Equals `max(yac, stump)` unless
+    /// a validated re-read lowered it.
+    pub final_page: i32,
+    /// The converged completion state both sides should hold after this sync.
+    /// Recorded into `sync_state` (H6/M2). Equals `yac.read || stump.is_complete()`
+    /// unless a validated unread regression cleared it.
+    pub final_complete: bool,
 }
 
 /// A Stump library as returned by the root `libraries` query. Used for
@@ -98,6 +113,24 @@ impl StumpMedia {
     /// A comic is complete iff Stump recorded at least one finished session.
     pub fn is_complete(&self) -> bool {
         !self.read_history.is_empty()
+    }
+
+    /// The Stump-side "source last-modified" timestamp used for H6 conflict
+    /// detection: the active session's `updatedAt` if present, else the first
+    /// finished session's `completedAt`. Both are RFC3339 UTC strings emitted by
+    /// the same Stump server, so two such values compare correctly
+    /// lexically (lexical order == chronological order for a fixed RFC3339
+    /// format). Cross-server / mixed-offset comparison is NOT attempted — H6
+    /// only ever compares a Stump timestamp against an earlier Stump timestamp.
+    pub fn stump_timestamp(&self) -> Option<&str> {
+        self.read_progress
+            .as_ref()
+            .and_then(|rp| rp.updated_at.as_deref())
+            .or_else(|| {
+                self.read_history
+                    .first()
+                    .and_then(|fs| fs.completed_at.as_deref())
+            })
     }
 }
 

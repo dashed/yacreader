@@ -30,7 +30,9 @@ mod ffi {
         stump_library_path: String,
     }
 
-    #[derive(Debug)]
+    // No `#[derive(Debug)]`: this struct carries the `api_key` secret and cxx
+    // does not require Debug on bridged structs (audit M1). Nothing formats it
+    // with `{:?}`. The other bridged structs hold no secrets and keep Debug.
     struct SyncConfig {
         stump_url: String,
         api_key: String,
@@ -78,6 +80,28 @@ fn make_err(msg: String) -> ffi::SyncResult {
     }
 }
 
+/// Run an `extern "Rust"` FFI body, converting any caught panic into an error
+/// `SyncResult` (audit M7). A Rust panic must never unwind across the cxx/C++
+/// boundary — that would abort the entire YACReaderLibraryServer process.
+/// `AssertUnwindSafe` is sound here: on a caught panic we discard the closure's
+/// captures and return a freshly built value, observing no torn state.
+fn guard_result(body: impl FnOnce() -> ffi::SyncResult) -> ffi::SyncResult {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
+        .unwrap_or_else(|_| make_err("internal panic (caught)".into()))
+}
+
+/// Status-returning counterpart to [`guard_result`]: a caught panic yields a
+/// safe "not running" status carrying the same caught-panic marker.
+fn guard_status(body: impl FnOnce() -> ffi::SyncStatus) -> ffi::SyncStatus {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or_else(|_| {
+        ffi::SyncStatus {
+            is_running: false,
+            last_error: "internal panic (caught)".into(),
+            synced_count: 0,
+        }
+    })
+}
+
 fn library_configs_from_ffi(entries: &[ffi::LibraryEntry]) -> Vec<LibraryConfig> {
     entries
         .iter()
@@ -92,6 +116,10 @@ fn library_configs_from_ffi(entries: &[ffi::LibraryEntry]) -> Vec<LibraryConfig>
 }
 
 fn rust_sync_init(config: &ffi::SyncConfig) -> ffi::SyncResult {
+    guard_result(|| rust_sync_init_inner(config))
+}
+
+fn rust_sync_init_inner(config: &ffi::SyncConfig) -> ffi::SyncResult {
     // Per-entry config: each library carries its own ids/paths (no parallel
     // vectors, no equal-length check). Empty stump_* fields are auto-discovered.
     let libraries = library_configs_from_ffi(&config.libraries);
@@ -120,6 +148,10 @@ fn rust_sync_init(config: &ffi::SyncConfig) -> ffi::SyncResult {
 }
 
 fn rust_sync_push_progress(library_id: i64, comic_id: i64) -> ffi::SyncResult {
+    guard_result(|| rust_sync_push_progress_inner(library_id, comic_id))
+}
+
+fn rust_sync_push_progress_inner(library_id: i64, comic_id: i64) -> ffi::SyncResult {
     let guard = match RUNTIME.lock() {
         Ok(g) => g,
         Err(e) => return make_err(format!("lock poisoned: {e}")),
@@ -138,6 +170,10 @@ fn rust_sync_push_progress(library_id: i64, comic_id: i64) -> ffi::SyncResult {
 }
 
 fn rust_sync_push_all() -> ffi::SyncResult {
+    guard_result(rust_sync_push_all_inner)
+}
+
+fn rust_sync_push_all_inner() -> ffi::SyncResult {
     let guard = match RUNTIME.lock() {
         Ok(g) => g,
         Err(e) => return make_err(format!("lock poisoned: {e}")),
@@ -153,6 +189,10 @@ fn rust_sync_push_all() -> ffi::SyncResult {
 }
 
 fn rust_sync_pull_all() -> ffi::SyncResult {
+    guard_result(rust_sync_pull_all_inner)
+}
+
+fn rust_sync_pull_all_inner() -> ffi::SyncResult {
     let guard = match RUNTIME.lock() {
         Ok(g) => g,
         Err(e) => return make_err(format!("lock poisoned: {e}")),
@@ -168,6 +208,10 @@ fn rust_sync_pull_all() -> ffi::SyncResult {
 }
 
 fn rust_sync_sync_all() -> ffi::SyncResult {
+    guard_result(rust_sync_sync_all_inner)
+}
+
+fn rust_sync_sync_all_inner() -> ffi::SyncResult {
     let guard = match RUNTIME.lock() {
         Ok(g) => g,
         Err(e) => return make_err(format!("lock poisoned: {e}")),
@@ -183,6 +227,10 @@ fn rust_sync_sync_all() -> ffi::SyncResult {
 }
 
 fn rust_sync_shutdown() -> ffi::SyncResult {
+    guard_result(rust_sync_shutdown_inner)
+}
+
+fn rust_sync_shutdown_inner() -> ffi::SyncResult {
     let mut guard = match RUNTIME.lock() {
         Ok(g) => g,
         Err(e) => return make_err(format!("lock poisoned: {e}")),
@@ -201,6 +249,10 @@ fn rust_sync_shutdown() -> ffi::SyncResult {
 }
 
 fn rust_sync_status() -> ffi::SyncStatus {
+    guard_status(rust_sync_status_inner)
+}
+
+fn rust_sync_status_inner() -> ffi::SyncStatus {
     let guard = match RUNTIME.lock() {
         Ok(g) => g,
         Err(_) => {
@@ -268,5 +320,32 @@ mod ffi_tests {
             configs[1].stump_library_id.is_empty(),
             "empty stump id marks this entry for auto-discovery"
         );
+    }
+
+    /// M7: a panic inside an FFI body must be caught and mapped to a safe value
+    /// instead of unwinding across the cxx/C++ boundary (which aborts the whole
+    /// server). The default panic hook is silenced for the duration so the
+    /// deliberate panics don't spam the test output.
+    #[test]
+    fn test_ffi_guards_catch_panics() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let panicked = guard_result(|| -> ffi::SyncResult { panic!("boom") });
+        let panicked_status = guard_status(|| -> ffi::SyncStatus { panic!("boom") });
+        // Happy path is untouched by the guard.
+        let ok = guard_result(make_ok);
+
+        std::panic::set_hook(prev);
+
+        assert!(!panicked.success, "panicking body must yield failure");
+        assert_eq!(panicked.error_message, "internal panic (caught)");
+
+        assert!(!panicked_status.is_running);
+        assert_eq!(panicked_status.last_error, "internal panic (caught)");
+        assert_eq!(panicked_status.synced_count, 0);
+
+        assert!(ok.success, "non-panicking body must pass through unchanged");
+        assert!(ok.error_message.is_empty());
     }
 }

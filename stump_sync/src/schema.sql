@@ -16,7 +16,15 @@ CREATE TABLE IF NOT EXISTS media_mapping (
     filename TEXT NOT NULL,
     matched_via TEXT NOT NULL DEFAULT 'path',
     matched_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(library_mapping_id, yac_comic_info_id, stump_media_id)
+    -- M4: the UNIQUE key is (library_mapping_id, yac_comic_info_id) and does
+    -- NOT include the media id. A YAC comic maps to exactly one Stump media per
+    -- library; if Stump re-scans and the media id changes, insert_mapping
+    -- UPDATEs this row in place (ON CONFLICT DO UPDATE) rather than inserting a
+    -- duplicate. The previous key additionally keyed on the media id, which made
+    -- remapping impossible and left get_stump_id nondeterministic. The mapping
+    -- DB is a derived cache, so a mapping.db built with the old key is rebuilt
+    -- automatically by MappingDb::open on the user_version bump.
+    UNIQUE(library_mapping_id, yac_comic_info_id)
 );
 
 CREATE TABLE IF NOT EXISTS sync_state (

@@ -274,21 +274,32 @@ The sync service stores confirmed mappings in its own database, so matching only
 
 ### 5.3 Conflict Resolution
 
-When both systems have changed progress for the same comic since the last sync:
+When both systems have changed progress for the same comic since the last sync, the engine resolves each dimension **independently** (page and completion are decoupled — see the Phase 3 implementation note on `compute_bidirectional_delta`). The policy is **monotonic by default, with intentional-regression detection**:
 
 | Field | Resolution Rule | Rationale |
 |-------|----------------|-----------|
-| `currentPage` / `page` | `max(yacreader, stump)` | Reading progresses forward; the higher page is always more recent progress |
-| `read` / completion | `OR` — once read, stays read | Marking unread is a deliberate action, not a sync artifact |
-| `lastTimeOpened` / `updated_at` | Latest timestamp wins | Standard LWW (Last-Writer-Wins) |
+| `currentPage` / `page` | `max(yacreader, stump)` by default; a lower page is propagated only when detected as an intentional re-read (see below) | Reading normally advances forward, so the higher page is usually the most recent progress |
+| `read` / completion | `OR` — once read, stays read; **never silently regressed or cleared** by a sync | Marking unread is a deliberate user action that must not be inferred from a sync; a blind write must never lower an existing `read = 1` |
+| source timestamps (`lastTimeOpened`, `updatedAt`, `completedAt`) | **Not** last-writer-wins on the value. Each side's source timestamp is recorded **per-side** in `sync_state` and used only to detect intentional regressions (below) | A cross-server "latest wins" comparison is unsafe under clock skew; a per-side, same-clock comparison is not |
+
+> **Not LWW.** An earlier revision of this document specified "latest timestamp wins (LWW)" for timestamps. That is **not** the implemented or approved policy — comparing one server's wall clock against the other's to pick a winning value is unsafe when the two clocks are not synchronized. The engine never does a cross-server timestamp comparison to choose a value.
+
+**Intentional-regression (re-read) detection.** Pure `max(page)` would silently ignore a deliberate re-read (page moved backward). To catch a genuine re-read *without* being fooled by clock skew, the engine compares **a single side against its own last-synced state** (same clock on both sides of the comparison, so cross-server skew is irrelevant):
+
+- that side's current page dropped **below the last-synced page** recorded for that side, **and**
+- that side's current source timestamp is **newer** than the last-synced timestamp recorded for that side.
+
+When both hold, the lower page is treated as an intentional re-read and propagated to the other side; otherwise progress only ever advances forward. The per-side last-synced page/timestamp pairs live in the `sync_state` table.
+
+**Append-only caveat (Stump):** Stump's read history is append-only (completion = the presence of a `FinishedReadingSession`). A *re-read* (page regression) can be propagated, but **"unmark as read" cannot be fully propagated to Stump** — there is no mutation that removes a finished session. Symmetrically, YACReader's `read` flag is never lowered by a pull.
 
 **Edge cases:**
 
-1. **Comic completed in Stump but not YACReader**: Stump has a `finished_reading_session` but no active session. Sync service sets YACReader `read = true` and `currentPage = numPages`.
+1. **Comic completed in Stump but not YACReader**: Stump has a `FinishedReadingSession` but no active session. Sync sets YACReader `read = true` and `currentPage = numPages`.
 
-2. **Comic completed in YACReader but not Stump**: YACReader has `read = true`. Sync service calls `markMediaAsComplete(id, isComplete: true)` on Stump.
+2. **Comic completed in YACReader but not Stump**: YACReader has `read = true`. Sync calls `markMediaAsComplete(id, isComplete: true)` on Stump — gated on `!stump_complete` so the append-only history is not duplicated.
 
-3. **Page regressed**: User re-reads from an earlier page. The `max()` rule would ignore this. Mitigation: if the timestamp on the "lower" page is significantly newer (configurable threshold, e.g., > 5 minutes), treat it as an intentional re-read and accept the lower page. Default behavior: always advance forward (matches YACReader's own sync behavior).
+3. **Page regressed (re-read)**: handled by the intentional-regression detection above — a lower page is accepted and propagated only when that same side's source timestamp is newer than its last-synced timestamp; otherwise `max()` keeps progress moving forward.
 
 ### 5.4 Sync Protocol
 
@@ -908,10 +919,10 @@ The recommended implementation path is a **fork of YACReaderLibraryServer** with
 1. Add Stump → YACReader progress pulling to the Rust module:
    - Polling: periodic GraphQL query for progress changes (timer-based or `PRAGMA data_version` on Stump's DB if co-located)
    - Optional: WebSocket subscription to Stump's `readEvents` for library structure changes (§5.5.2)
-2. Implement conflict resolution in the Rust sync engine (§5.3):
-   - `currentPage`: `max(yacreader, stump)`
-   - `read` / completion: `OR` (once read, stays read)
-   - `lastTimeOpened` / `updated_at`: latest timestamp wins (LWW)
+2. Implement conflict resolution in the Rust sync engine (§5.3) — monotonic by default with intentional-regression detection:
+   - `currentPage`: `max(yacreader, stump)` by default; a lower page is propagated only when detected as an intentional re-read
+   - `read` / completion: `OR` (once read, stays read; never silently regressed or cleared)
+   - source timestamps: **not** last-writer-wins. Per-side source timestamps are recorded in `sync_state` and compared only against that **same side's** last-synced timestamp (same clock, robust to cross-server skew) to detect an intentional re-read. Stump's read history is append-only, so "unmark as read" cannot be fully propagated to Stump.
 3. ~~Add Rust → C++ callback for updating YACReader's `.ydb`~~ → **Direct Rust writes** to .ydb via rusqlite (see implementation notes)
 4. Test: read in Stump web reader → Rust module detects change → writes to YACReader → progress visible on next iOS sync.
 
@@ -924,7 +935,7 @@ The recommended implementation path is a **fork of YACReaderLibraryServer** with
 - **`sync_all()` method** — combined bidirectional sync in one pass: reads both systems, computes bidirectional deltas, applies pushes (GraphQL) and pulls (.ydb writes) in a single cycle.
 - **Periodic polling** — `tokio::select!` with configurable `sync_interval_secs` timer. When > 0, `sync_all()` runs automatically on the interval. The first tick is skipped (no immediate sync on startup).
 - **`read_all_yac_comics()`** — variant without `WHERE hasBeenOpened = 1` filter, so Stump progress for comics not yet opened in YACReader can be pulled.
-- **`compute_bidirectional_delta()`** — max-page-wins conflict resolution with OR completion logic. Page priority takes precedence over completion direction.
+- **`compute_bidirectional_delta()`** — resolves page and completion as **independent** dimensions: `final_page = max(both sides)` (monotonic, with intentional-regression detection via `sync_state`) and `final_complete = yac.read || stump.complete` (`OR`). Completion is **not** subordinate to page direction; a blind write never lowers an existing `read = 1` or regresses the page (this was the C2 data-loss fix).
 - 56 tests: 41 unit + 6 bidirectional E2E (pull, mixed, conflict, completion, sync state, push regression) + 4 integration + 5 flow.
 
 ### Phase 4: Polish and Optional Upstream
@@ -1410,7 +1421,7 @@ YACReaderLibraryServer already emits two Qt signals on progress updates that hav
 // YACReaderLibraryServer/main.cpp — additions for Stump sync
 // (lines reference the existing start() function)
 
-#include "stump_sync/src/lib.rs.h"  // cxx-generated header
+#include "stump_sync_bridge/lib.h"  // cxx bridge header (from corrosion_add_cxxbridge)
 
 // --- In start(), after LibrariesUpdateCoordinator init (line 251) ---
 
@@ -1485,49 +1496,61 @@ This is safe because YACReader's DBHelper uses per-thread SQLite connections wit
 
 ### 9.6 CMake Integration
 
-The Rust crate is integrated into YACReaderLibraryServer's CMake build using the `corrosion` module, which bridges Cargo and CMake.
+The Rust crate is integrated via the **Corrosion** CMake module (the Cargo↔CMake bridge) plus Corrosion's `corrosion_add_cxxbridge` helper, which generates and compiles the cxx bridge, exposes its generated-header include directory, and links the C++ glue against the Rust staticlib. The wiring is split across two files and is gated on the `ENABLE_STUMP_SYNC` option (**OFF by default**).
 
-**Full CMake additions for `YACReaderLibraryServer/CMakeLists.txt`:**
+`cxx` is a **non-optional** dependency of the crate: Corrosion discovers the required `cxxbridge` version via `cargo tree -i cxx` (run with no features), so a feature-gated `cxx` would be invisible to it and the CMake build would fail. The `ffi` Cargo feature only gates the bridge glue that the crate's `build.rs` compiles for standalone `cargo test --features ffi`; under CMake that glue is produced by `corrosion_add_cxxbridge` instead (hence `STUMP_SYNC_SKIP_CXX_BUILD=1`, which stops `build.rs` from compiling it a second time and defining the cxx shim symbols twice).
+
+**Top-level `CMakeLists.txt` — fetch Corrosion, import the crate (with `ffi`), generate the bridge:**
 
 ```cmake
-# --- Rust stump_sync integration ---
-
-# Fetch corrosion (Rust-CMake bridge)
-include(FetchContent)
-FetchContent_Declare(
-    Corrosion
-    GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
-    GIT_TAG v0.5.1  # pin to specific release
-)
-FetchContent_MakeAvailable(Corrosion)
-
-# Import the Rust crate as a CMake target
-corrosion_import_crate(
-    MANIFEST_PATH ${CMAKE_SOURCE_DIR}/stump_sync/Cargo.toml
-)
-
-# Link the Rust static library into the server executable
-target_link_libraries(YACReaderLibraryServer
-    PRIVATE
-    stump-sync  # target name from Cargo.toml [package].name
-)
-
-# Platform-specific system libraries required by Rust dependencies
-if(UNIX AND NOT APPLE)
-    target_link_libraries(YACReaderLibraryServer PRIVATE pthread dl m)
-elseif(APPLE)
-    target_link_libraries(YACReaderLibraryServer PRIVATE
-        "-framework Security"
-        "-framework SystemConfiguration"
+if(ENABLE_STUMP_SYNC)
+    include(FetchContent)
+    FetchContent_Declare(
+        Corrosion
+        GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+        GIT_TAG v0.5.1  # pin to a specific release
     )
-endif()
+    FetchContent_MakeAvailable(Corrosion)
 
-# Include path for cxx-generated headers
-target_include_directories(YACReaderLibraryServer
-    PRIVATE
-    ${CMAKE_BINARY_DIR}/corrosion_generated/cxxbridge/stump-sync/src/
-)
+    # Import the Rust staticlib WITH the `ffi` feature. The CMake target name is
+    # the Cargo lib name `stump_sync` (underscores), not the package name.
+    corrosion_import_crate(MANIFEST_PATH ${CMAKE_SOURCE_DIR}/stump_sync/Cargo.toml FEATURES ffi)
+
+    # build.rs can also compile the cxx glue (for standalone `cargo test
+    # --features ffi`). Skip that here so the bridge is produced solely by
+    # corrosion_add_cxxbridge below — otherwise the cxx shim symbols are defined
+    # twice and fail to link.
+    corrosion_set_env_vars(stump_sync "STUMP_SYNC_SKIP_CXX_BUILD=1")
+
+    # Generate + compile the cxx bridge into target `stump_sync_bridge`. FILES is
+    # resolved relative to the crate's src/ dir, so it is `lib.rs` (not
+    # src/lib.rs). This sets up the generated-header include dir and links the
+    # glue against the Rust crate. The C++ side includes it as
+    # `#include "stump_sync_bridge/lib.h"` (the cxxbridge CLI names the header
+    # lib.h via NAME_WE).
+    corrosion_add_cxxbridge(stump_sync_bridge CRATE stump_sync FILES lib.rs)
+endif()
 ```
+
+**`YACReaderLibraryServer/CMakeLists.txt` — link the bridge target + platform libs:**
+
+```cmake
+if(ENABLE_STUMP_SYNC)
+    # stump_sync_bridge carries the generated cxx header include dir, the
+    # compiled C++ glue, and transitively the Rust staticlib. Linking it is what
+    # makes `#include "stump_sync_bridge/lib.h"` resolve and the symbols link.
+    target_link_libraries(YACReaderLibraryServer PRIVATE stump_sync_bridge)
+    target_compile_definitions(YACReaderLibraryServer PRIVATE ENABLE_STUMP_SYNC)
+    if(APPLE)
+        target_link_libraries(YACReaderLibraryServer PRIVATE
+            "-framework Security" "-framework CoreFoundation" "-framework SystemConfiguration")
+    elseif(UNIX)
+        target_link_libraries(YACReaderLibraryServer PRIVATE pthread dl m)
+    endif()
+endif()
+```
+
+No manual `target_include_directories` is needed: `corrosion_add_cxxbridge` attaches the generated-header include dir to the `stump_sync_bridge` target, so linking that target is sufficient for the `#include "stump_sync_bridge/lib.h"` to resolve.
 
 **Updated dependency chain (standalone mode):**
 
@@ -1541,7 +1564,7 @@ YACReaderLibraryServer (executable)
 ├── cbx_backend (STATIC)
 ├── naturalsort, yr_global (STATIC)
 ├── QsLog, QrCode, QtWebApp_httpserver (STATIC)
-└── stump-sync (STATIC IMPORTED — Rust via corrosion)
+└── stump_sync (Rust staticlib via corrosion) + stump_sync_bridge (cxx glue from corrosion_add_cxxbridge)
     ├── reqwest (HTTP client)
     ├── tokio (async runtime)
     ├── rusqlite (SQLite for ID mapping)

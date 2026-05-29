@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::types::{MediaMapping, SyncError, SyncState};
 
@@ -10,6 +10,11 @@ pub struct MappingDb {
 
 const SCHEMA: &str = include_str!("schema.sql");
 
+/// Bumped whenever the derived-table layout changes in a way that
+/// `CREATE TABLE IF NOT EXISTS` cannot migrate. v2 = M4's media_mapping
+/// UNIQUE-key change (drop stump_media_id from the key).
+const SCHEMA_VERSION: i64 = 2;
+
 impl MappingDb {
     pub fn open(path: &str) -> Result<Self, SyncError> {
         let conn = Connection::open_with_flags(
@@ -17,7 +22,37 @@ impl MappingDb {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+
+        // M4 migration: `CREATE TABLE IF NOT EXISTS` cannot change an existing
+        // table's UNIQUE key, so an existing mapping.db keeps the obsolete
+        // (library, yac_comic, stump_media) key under which a re-matched comic
+        // inserts a DUPLICATE row. The mapping DB is a derived cache (rebuilt
+        // from match_comics on the next sync), so when we detect the old key we
+        // drop the derived tables and let the new schema recreate them. The
+        // referencing table (sync_state) is dropped first to satisfy the FK;
+        // its baselines are simply re-observed on the next sync (worst case:
+        // one monotonic, regression-free cycle — never data loss).
+        let legacy_media_key = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='media_mapping'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            // The v1 key was `UNIQUE(library_mapping_id, yac_comic_info_id,
+            // stump_media_id)`; v2 drops the trailing column. Match the full
+            // 3-column clause (sqlite_master stores the CREATE verbatim,
+            // comments included, so a looser substring could false-match prose).
+            .map(|sql| sql.contains("yac_comic_info_id, stump_media_id)"))
+            .unwrap_or(false);
+        if legacy_media_key {
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS sync_state; DROP TABLE IF EXISTS media_mapping;",
+            )?;
+        }
+
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -57,13 +92,18 @@ impl MappingDb {
 
     pub fn get_stump_id(&self, yac_comic_info_id: i64) -> Result<Option<String>, SyncError> {
         let conn = self.lock_conn()?;
+        // M4: with UNIQUE(library_mapping_id, yac_comic_info_id) there is at most
+        // one row per (library, comic); the ORDER BY makes the result fully
+        // deterministic even if the same comic_info_id appears across libraries
+        // (most-recently-matched wins).
         let result = conn
             .query_row(
-                "SELECT stump_media_id FROM media_mapping WHERE yac_comic_info_id = ?1",
+                "SELECT stump_media_id FROM media_mapping WHERE yac_comic_info_id = ?1 \
+                 ORDER BY matched_at DESC, id DESC LIMIT 1",
                 params![yac_comic_info_id],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()?;
         Ok(result)
     }
 
@@ -71,11 +111,12 @@ impl MappingDb {
         let conn = self.lock_conn()?;
         let result = conn
             .query_row(
-                "SELECT yac_comic_info_id FROM media_mapping WHERE stump_media_id = ?1",
+                "SELECT yac_comic_info_id FROM media_mapping WHERE stump_media_id = ?1 \
+                 ORDER BY matched_at DESC, id DESC LIMIT 1",
                 params![stump_media_id],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()?;
         Ok(result)
     }
 
@@ -90,11 +131,29 @@ impl MappingDb {
         matched_via: &str,
     ) -> Result<i64, SyncError> {
         let conn = self.lock_conn()?;
+        // M4: UPSERT on the (library, comic) key so a re-matched comic whose
+        // Stump media id changed UPDATEs its existing row instead of inserting a
+        // duplicate (the old `INSERT OR IGNORE` left a stale row AND a new one,
+        // making get_stump_id nondeterministic).
         conn.execute(
-            "INSERT OR IGNORE INTO media_mapping (library_mapping_id, yac_comic_info_id, yac_comic_id, stump_media_id, relative_path, filename, matched_via) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO media_mapping (library_mapping_id, yac_comic_info_id, yac_comic_id, stump_media_id, relative_path, filename, matched_via) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(library_mapping_id, yac_comic_info_id) DO UPDATE SET \
+                stump_media_id=excluded.stump_media_id, \
+                relative_path=excluded.relative_path, \
+                filename=excluded.filename, \
+                matched_via=excluded.matched_via, \
+                matched_at=datetime('now')",
             params![library_mapping_id, yac_comic_info_id, yac_comic_id, stump_media_id, relative_path, filename, matched_via],
         )?;
-        Ok(conn.last_insert_rowid())
+        // last_insert_rowid() is unreliable on the DO UPDATE path, so read the
+        // (now-unique) row's id back explicitly.
+        let id: i64 = conn.query_row(
+            "SELECT id FROM media_mapping WHERE library_mapping_id = ?1 AND yac_comic_info_id = ?2",
+            params![library_mapping_id, yac_comic_info_id],
+            |row| row.get(0),
+        )?;
+        Ok(id)
     }
 
     pub fn get_sync_state(&self, media_mapping_id: i64) -> Result<Option<SyncState>, SyncError> {
@@ -117,7 +176,7 @@ impl MappingDb {
                     })
                 },
             )
-            .ok();
+            .optional()?;
         Ok(result)
     }
 
@@ -213,6 +272,81 @@ mod tests {
 
         assert_eq!(db.get_stump_id(999).unwrap(), None);
         assert_eq!(db.get_yac_id("nonexistent").unwrap(), None);
+    }
+
+    /// Regression for the migration heuristic: re-opening a CURRENT-schema
+    /// mapping.db must NOT be mistaken for the legacy schema and must preserve
+    /// all derived rows.
+    #[test]
+    fn test_reopen_preserves_mappings() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        {
+            let db = MappingDb::open(path).unwrap();
+            let lib = db.ensure_library_mapping("/c", "s", "/srv/c").unwrap();
+            db.insert_mapping(lib, 1, 2, "sm-1", "a.cbz", "a.cbz", "path")
+                .unwrap();
+        }
+        let db = MappingDb::open(path).unwrap();
+        assert_eq!(
+            db.get_stump_id(1).unwrap(),
+            Some("sm-1".to_string()),
+            "re-opening a current-schema DB must preserve mappings"
+        );
+    }
+
+    /// M4 migration: a mapping.db built with the OLD 3-column UNIQUE key (which
+    /// allowed duplicate rows for one comic) is detected on open, its derived
+    /// tables dropped, and recreated with the 2-column key that upserts in place.
+    #[test]
+    fn test_legacy_schema_is_rebuilt() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE library_mapping (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    yac_library_path TEXT NOT NULL,
+                    stump_library_id TEXT NOT NULL,
+                    stump_library_path TEXT NOT NULL,
+                    UNIQUE(yac_library_path, stump_library_id)
+                );
+                CREATE TABLE media_mapping (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    library_mapping_id INTEGER NOT NULL REFERENCES library_mapping(id),
+                    yac_comic_info_id INTEGER NOT NULL,
+                    yac_comic_id INTEGER NOT NULL,
+                    stump_media_id TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    matched_via TEXT NOT NULL DEFAULT 'path',
+                    matched_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(library_mapping_id, yac_comic_info_id, stump_media_id)
+                );
+                INSERT INTO library_mapping (id, yac_library_path, stump_library_id, stump_library_path)
+                    VALUES (1, '/c', 's', '/srv/c');
+                INSERT INTO media_mapping (library_mapping_id, yac_comic_info_id, yac_comic_id, stump_media_id, relative_path, filename, matched_via)
+                    VALUES (1, 1, 2, 'old-1', 'a.cbz', 'a.cbz', 'path'),
+                           (1, 1, 2, 'old-2', 'a.cbz', 'a.cbz', 'path');",
+            )
+            .unwrap();
+        }
+
+        let db = MappingDb::open(path).unwrap();
+        let lib = db.ensure_library_mapping("/c", "s", "/srv/c").unwrap();
+        assert!(
+            db.get_all_mappings(lib).unwrap().is_empty(),
+            "legacy derived rows are dropped; they rebuild on the next sync"
+        );
+
+        // The rebuilt table enforces the new key: a remap upserts in place.
+        db.insert_mapping(lib, 1, 2, "new-1", "a.cbz", "a.cbz", "path")
+            .unwrap();
+        db.insert_mapping(lib, 1, 2, "new-2", "a.cbz", "a.cbz", "path")
+            .unwrap();
+        assert_eq!(db.get_all_mappings(lib).unwrap().len(), 1);
+        assert_eq!(db.get_stump_id(1).unwrap(), Some("new-2".to_string()));
     }
 
     #[test]

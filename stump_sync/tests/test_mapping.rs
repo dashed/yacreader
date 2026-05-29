@@ -34,6 +34,46 @@ fn test_full_mapping_lifecycle() {
     assert_eq!(mappings[1].relative_path, "DC/001.cbz");
 }
 
+/// M4: re-matching the same YAC comic to a NEW Stump media id must UPDATE the
+/// existing row in place (the old `INSERT OR IGNORE` + 3-column UNIQUE left a
+/// stale row and inserted a duplicate, making get_stump_id nondeterministic).
+#[test]
+fn test_remap_updates_existing_row() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("mappings.db");
+    let db = MappingDb::open(db_path.to_str().unwrap()).unwrap();
+
+    let lib_id = db
+        .ensure_library_mapping("/comics", "stump-lib-1", "/srv/comics")
+        .unwrap();
+
+    let id1 = db
+        .insert_mapping(lib_id, 100, 200, "old-stump-id", "Marvel/001.cbz", "001.cbz", "path")
+        .unwrap();
+    // Stump re-scanned and the media id changed for the SAME comic.
+    let id2 = db
+        .insert_mapping(lib_id, 100, 200, "new-stump-id", "Marvel/001.cbz", "001.cbz", "path")
+        .unwrap();
+
+    assert_eq!(id1, id2, "remap must reuse the same row id (UPDATE, not INSERT)");
+
+    let mappings = db.get_all_mappings(lib_id).unwrap();
+    let rows_for_100: Vec<_> = mappings
+        .iter()
+        .filter(|m| m.yac_comic_info_id == 100)
+        .collect();
+    assert_eq!(rows_for_100.len(), 1, "exactly one row after a remap");
+
+    // Lookups are deterministic and resolve to the NEW id only.
+    assert_eq!(db.get_stump_id(100).unwrap(), Some("new-stump-id".to_string()));
+    assert_eq!(db.get_yac_id("new-stump-id").unwrap(), Some(100));
+    assert_eq!(
+        db.get_yac_id("old-stump-id").unwrap(),
+        None,
+        "the stale id no longer resolves"
+    );
+}
+
 #[test]
 fn test_ensure_library_mapping_idempotent_across_sessions() {
     let dir = TempDir::new().unwrap();

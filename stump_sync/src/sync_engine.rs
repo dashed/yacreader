@@ -8,7 +8,7 @@ use crate::mapping_db::MappingDb;
 use crate::stump_client::StumpClient;
 use crate::types::{
     BidirectionalDelta, ComicProgress, PullAction, PushAction, StumpLibrary, StumpMedia, SyncDelta,
-    SyncError, SyncReport,
+    SyncError, SyncReport, SyncState,
 };
 
 /// Current wall-clock time in epoch seconds (0 on the impossible pre-epoch case).
@@ -76,11 +76,19 @@ impl SyncEngine {
                 SyncError::Database(format!("comic {comic_id} not found in ydb"))
             })?;
 
+        // M3: fetch Stump media ONCE and reuse it for both mapping-building (on a
+        // cache miss) and the lookup below (was fetched inside build_mappings AND
+        // again here).
+        let stump_media_list = self
+            .client
+            .get_library_media(&lib_config.stump_library_id)
+            .await?;
+
         let stump_media_id = match self.mapping_db.get_stump_id(comic.comic_info_id)? {
             Some(id) => id,
             None => {
                 tracing::info!(comic_id, "no mapping found, building mappings");
-                self.build_mappings(&lib_config, lib_mapping_id).await?;
+                self.build_mappings(&lib_config, lib_mapping_id, &comics, &stump_media_list)?;
                 self.mapping_db
                     .get_stump_id(comic.comic_info_id)?
                     .ok_or_else(|| {
@@ -92,10 +100,6 @@ impl SyncEngine {
             }
         };
 
-        let stump_media_list = self
-            .client
-            .get_library_media(&lib_config.stump_library_id)
-            .await?;
         let stump_media = stump_media_list
             .iter()
             .find(|m| m.id == stump_media_id)
@@ -151,14 +155,16 @@ impl SyncEngine {
         lib_mapping_id: i64,
         report: &mut SyncReport,
     ) -> Result<(), SyncError> {
-        let matched = self.build_mappings(lib_config, lib_mapping_id).await?;
-        report.comics_matched += matched;
-
+        // M3: fetch the .ydb comics and Stump media ONCE, then reuse the same
+        // data for both mapping-building and the push loop (was fetched twice).
         let comics = read_yac_comics(&lib_config.ydb_path)?;
         let stump_media = self
             .client
             .get_library_media(&lib_config.stump_library_id)
             .await?;
+
+        let matched = self.build_mappings(lib_config, lib_mapping_id, &comics, &stump_media)?;
+        report.comics_matched += matched;
 
         let stump_map: std::collections::HashMap<&str, &StumpMedia> =
             stump_media.iter().map(|m| (m.id.as_str(), m)).collect();
@@ -195,18 +201,19 @@ impl SyncEngine {
         Ok(())
     }
 
-    pub async fn build_mappings(
+    /// Build (and refresh) YAC↔Stump media mappings from ALREADY-FETCHED data
+    /// (M3): the caller fetches `yac_comics` + `stump_media` once and passes them
+    /// in, so this no longer re-reads the .ydb or re-hits the Stump GraphQL API
+    /// (the previous version double-fetched both right before the caller used
+    /// them again).
+    pub fn build_mappings(
         &self,
         lib_config: &LibraryConfig,
         lib_mapping_id: i64,
+        yac_comics: &[ComicProgress],
+        stump_media: &[StumpMedia],
     ) -> Result<u32, SyncError> {
-        let yac_comics = read_yac_comics(&lib_config.ydb_path)?;
-        let stump_media = self
-            .client
-            .get_library_media(&lib_config.stump_library_id)
-            .await?;
-
-        let matches = match_comics(&yac_comics, &stump_media, &lib_config.stump_library_path);
+        let matches = match_comics(yac_comics, stump_media, &lib_config.stump_library_path);
 
         let mut count = 0u32;
         for (comic, media) in &matches {
@@ -347,8 +354,22 @@ impl SyncEngine {
             .collect();
 
         for (comic, media) in &matches {
+            let mapping_id = mapping_by_comic.get(&comic.comic_info_id).copied();
+
+            // H6/M2: read the LAST CONVERGED state for this comic (page, read,
+            // and the per-side source timestamps observed at that sync) and feed
+            // it into reconciliation so a validated, same-side, timestamp-checked
+            // re-read / unread can be honored. get_sync_state is read at the
+            // start of this comic's reconciliation, before its own write below,
+            // so there is no self-contamination. First sync (no row) => None =>
+            // pure monotonic, no regression possible.
+            let prev = match mapping_id {
+                Some(id) => self.mapping_db.get_sync_state(id)?,
+                None => None,
+            };
+
             let delta =
-                compute_bidirectional_delta(comic, media, &lib_config.ydb_path);
+                compute_bidirectional_delta(comic, media, &lib_config.ydb_path, prev.as_ref());
 
             // Push and pull are independent: a single comic may need both (e.g.
             // YAC ahead on page while Stump holds completion).
@@ -361,15 +382,21 @@ impl SyncEngine {
                 self.apply_pull_delta(&delta, pull, comic.current_page, report);
             }
 
-            if let Some(&mapping_id) = mapping_by_comic.get(&comic.comic_info_id) {
+            // H6/M2: record the CONVERGED final state (same value on both sides)
+            // plus the SOURCE timestamps just observed, so the next sync has an
+            // honest baseline. Fixes M2 (was pre-sync per-side values + NULL
+            // timestamps, and get_sync_state was never read in production).
+            if let Some(id) = mapping_id {
+                let yac_modified = comic.last_time_opened.map(|t| t.to_string());
+                let stump_modified = media.stump_timestamp().map(|s| s.to_string());
                 let _ = self.mapping_db.update_sync_state(
-                    mapping_id,
-                    comic.current_page,
-                    media.current_page(),
-                    comic.read,
-                    media.is_complete(),
-                    None,
-                    None,
+                    id,
+                    delta.final_page,
+                    delta.final_page,
+                    delta.final_complete,
+                    delta.final_complete,
+                    yac_modified.as_deref(),
+                    stump_modified.as_deref(),
                 );
             }
         }
@@ -424,6 +451,7 @@ impl SyncEngine {
             page,
             delta.num_pages,
             pull.set_read,
+            pull.allow_regression,
             pull.last_opened,
         ) {
             Ok(()) => {
@@ -507,26 +535,45 @@ pub fn normalize_path(path: &str, filename: &str) -> String {
     }
 }
 
+/// Return `media_path` expressed relative to `library_path`, or `None` when the
+/// media does not live under the library. Unlike a raw string prefix, this
+/// requires a real PATH-COMPONENT boundary (M5): `/srv/comics` matches
+/// `/srv/comics/x.cbz` but NOT the sibling `/srv/comics-extra/x.cbz`. Both paths
+/// are normalized first (collapse `//`, trim a trailing `/`).
+pub fn relative_under(library_path: &str, media_path: &str) -> Option<String> {
+    let lib = normalize_fs_path(library_path);
+    let media = normalize_fs_path(media_path);
+
+    // Root library: every absolute media path is relative to "/".
+    if lib == "/" {
+        let rel = media.trim_start_matches('/');
+        return if rel.is_empty() {
+            None
+        } else {
+            Some(rel.to_string())
+        };
+    }
+
+    // Requiring the `lib + "/"` prefix enforces the path boundary: a sibling
+    // directory whose name merely starts with `lib` (…-extra) is rejected
+    // because it lacks the separator right after `lib`.
+    let prefix = format!("{lib}/");
+    let relative = media.strip_prefix(&prefix)?;
+    if relative.is_empty() {
+        None
+    } else {
+        Some(relative.to_string())
+    }
+}
+
 pub fn match_comics<'a>(
     yac_comics: &'a [ComicProgress],
     stump_media: &'a [StumpMedia],
     stump_library_path: &str,
 ) -> Vec<(&'a ComicProgress, &'a StumpMedia)> {
-    let stump_library_path = stump_library_path.trim_end_matches('/');
-
     let stump_by_relative: std::collections::HashMap<String, &StumpMedia> = stump_media
         .iter()
-        .filter_map(|m| {
-            let relative = m
-                .path
-                .strip_prefix(stump_library_path)?
-                .trim_start_matches('/');
-            if relative.is_empty() {
-                None
-            } else {
-                Some((relative.to_string(), m))
-            }
-        })
+        .filter_map(|m| relative_under(stump_library_path, &m.path).map(|rel| (rel, m)))
         .collect();
 
     let mut matches = Vec::new();
@@ -538,11 +585,28 @@ pub fn match_comics<'a>(
     matches
 }
 
-/// Normalize a filesystem path for comparison: trim a single trailing '/'
-/// (without turning a bare "/" into the empty string).
+/// Normalize a filesystem path for comparison (M5): collapse any run of '/'
+/// into a single '/', then trim a trailing '/' (without turning a bare "/" into
+/// the empty string). NOTE: case- and Unicode-NFC-folding are deliberately NOT
+/// applied — they are environment-dependent and would require a new dependency;
+/// that remains a documented limitation.
 pub fn normalize_fs_path(path: &str) -> String {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() && !path.is_empty() {
+    let mut collapsed = String::with_capacity(path.len());
+    let mut prev_slash = false;
+    for ch in path.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                collapsed.push('/');
+            }
+            prev_slash = true;
+        } else {
+            collapsed.push(ch);
+            prev_slash = false;
+        }
+    }
+
+    let trimmed = collapsed.trim_end_matches('/');
+    if trimmed.is_empty() && !collapsed.is_empty() {
         "/".to_string()
     } else {
         trimmed.to_string()
@@ -699,12 +763,24 @@ pub fn read_all_yac_comics(ydb_path: &str) -> Result<Vec<ComicProgress>, SyncErr
     Ok(comics)
 }
 
-/// Apply pulled progress to the YACReader `.ydb` using a read-modify-write so
-/// progress is monotonic and lossless (fixes C2/H4):
+/// Apply pulled progress to the YACReader `.ydb` using a read-modify-write.
+///
+/// By DEFAULT (`allow_regression = false`) the write is monotonic and lossless
+/// (C2/H4) — this guards EVERY normal pull:
 ///   * `currentPage` never regresses (`max(existing, incoming)`),
 ///   * an existing `read = 1` is never cleared,
+///   * page-based auto-complete may RAISE `read`,
 ///   * `hasBeenOpened` is sticky once set,
 ///   * `lastTimeOpened` only advances.
+///
+/// When `allow_regression = true` the engine has computed an EXACT converged
+/// state from a validated, same-side, timestamp-checked re-read / unread (H6),
+/// so the monotonic page/read guards are bypassed: `currentPage` is set to
+/// `page` verbatim (may be LOWER) and `read` is set to `read` verbatim (may be
+/// CLEARED). `hasBeenOpened` stays sticky and `lastTimeOpened` still only
+/// advances even in this mode (re-reading is still "having opened" the comic,
+/// and never moving the clock backward keeps the H6 baseline monotone).
+///
 /// A `busy_timeout` is set (H3) so a lock held by the live server is waited out
 /// rather than failing immediately. The UPDATE is skipped when nothing changed.
 pub fn write_yac_progress(
@@ -713,6 +789,7 @@ pub fn write_yac_progress(
     page: i32,
     num_pages: i32,
     read: bool,
+    allow_regression: bool,
     last_time_opened: Option<i64>,
 ) -> Result<(), SyncError> {
     let conn = rusqlite::Connection::open_with_flags(
@@ -756,12 +833,21 @@ pub fn write_yac_progress(
         num_pages
     };
 
-    // Page never regresses.
-    let new_page = existing_page.max(page);
-    // Completion is monotonic: never clear an existing read flag.
-    let new_read =
-        existing_read || read || (effective_num_pages > 0 && new_page >= effective_num_pages);
-    // hasBeenOpened is sticky once set.
+    let (new_page, new_read) = if allow_regression {
+        // Validated regression: trust the engine's exact converged values. Page
+        // may drop below the existing page; read may be cleared. No page-based
+        // auto-complete here (it would fight a deliberate re-read).
+        (page, read)
+    } else {
+        // Monotonic, C2-safe: page never regresses; an existing read=1 is never
+        // cleared; auto-complete may RAISE read.
+        let new_page = existing_page.max(page);
+        let new_read =
+            existing_read || read || (effective_num_pages > 0 && new_page >= effective_num_pages);
+        (new_page, new_read)
+    };
+    // hasBeenOpened is sticky once set (true even on a regression — re-reading a
+    // comic does not un-open it).
     let new_hbo = existing_hbo || new_page > 0 || new_read;
 
     let content_changed =
@@ -800,26 +886,110 @@ pub fn write_yac_progress(
     Ok(())
 }
 
-/// Reconcile one comic across YACReader and Stump, resolving page and completion
-/// as INDEPENDENT dimensions (fixes C2/H4):
-///   * `final_page     = max(yac.current_page, stump_page)`
-///   * `final_complete = yac.read || stump.is_complete()`  (monotonic)
-/// Stump is pushed to whenever it is behind on either dimension; YACReader is
-/// pulled to whenever it is behind on either dimension. A single comic can
-/// therefore require both a push and a pull at once.
+/// True iff `current` is strictly newer than `baseline`, where both are YAC
+/// `lastTimeOpened` epoch seconds (same clock, skew-safe). ANY missing value =>
+/// NOT newer, so unverifiable data can never trigger a regression (H6 safety).
+/// `update_sync_state` stores the baseline as a stringified i64, so it
+/// round-trips through `parse`.
+fn yac_ts_newer(current: Option<i64>, baseline: Option<&str>) -> bool {
+    match (current, baseline.and_then(|s| s.parse::<i64>().ok())) {
+        (Some(c), Some(b)) => c > b,
+        _ => false,
+    }
+}
+
+/// True iff `current` is strictly newer than `baseline`, where both are Stump
+/// RFC3339 UTC timestamp strings emitted by the SAME server (so a lexical
+/// compare equals a chronological one for the fixed format). ANY missing value
+/// => NOT newer (H6 safety).
+fn stump_ts_newer(current: Option<&str>, baseline: Option<&str>) -> bool {
+    match (current, baseline) {
+        (Some(c), Some(b)) => c > b,
+        _ => false,
+    }
+}
+
+/// Reconcile one comic across YACReader and Stump.
+///
+/// Page and completion are INDEPENDENT dimensions (C2/H4). The DEFAULT for each
+/// is monotonic — `final_page = max(yac, stump)`, `final_complete = yac.read ||
+/// stump.is_complete()` — which can never lose progress.
+///
+/// H6 layers INTENTIONAL-REGRESSION detection over that default, using the
+/// previous converged `sync_state` (`prev`) as a baseline. The rule is
+/// SAFETY-CRITICAL: a side may pull the other DOWN (lower page / cleared read)
+/// ONLY when it ALONE moved backward since the last sync AND its OWN source
+/// clock advanced past the recorded baseline (a same-side, skew-safe compare).
+/// If both sides or neither regressed — or any needed timestamp is missing — we
+/// keep the monotonic result, so stale/older data can NEVER regress or clear
+/// anything (the exact C2 data-loss this guards against). With no `prev` (first
+/// sync), no regression is possible.
+///
+/// Page convergence is clean: the lower page is propagated to BOTH sides, so the
+/// next baseline matches and it sticks. Completion can only ever be ADDED on
+/// Stump (`read_history` is append-only), so a YAC→Stump unread is honored for
+/// the current cycle (Stump's history is NOT cleared) and Stump, as source of
+/// truth, re-propagates completion on a later cycle — a documented limitation.
 pub fn compute_bidirectional_delta(
     yac: &ComicProgress,
     stump: &StumpMedia,
     ydb_path: &str,
+    prev: Option<&SyncState>,
 ) -> BidirectionalDelta {
     let stump_page = stump.current_page();
     let stump_complete = stump.is_complete();
+    let yac_page = yac.current_page;
+    let yac_read = yac.read;
+    let stump_ts = stump.stump_timestamp();
 
-    let final_page = yac.current_page.max(stump_page);
-    let final_complete = yac.read || stump_complete;
+    // ---- PAGE dimension ----
+    let mut final_page = yac_page.max(stump_page); // monotonic default
+    let mut page_regress_stump = false; // a Stump re-read pulls YAC DOWN
+    if let Some(prev) = prev {
+        let last_page = prev.yac_current_page; // converged page at last sync
+        let yac_back = yac_page < last_page
+            && yac_ts_newer(yac.last_time_opened, prev.yac_last_modified.as_deref());
+        let stump_back = stump_page < last_page
+            && stump_ts_newer(stump_ts, prev.stump_last_modified.as_deref());
+        if yac_back && !stump_back {
+            final_page = yac_page; // YAC's re-read wins; the lower page propagates to Stump
+        } else if stump_back && !yac_back {
+            final_page = stump_page; // Stump's re-read wins; the lower page propagates to YAC
+            page_regress_stump = true;
+        }
+        // both or neither => keep the monotonic max
+    }
 
-    // Push to Stump when Stump is behind on page and/or completion.
-    let push_page = if stump_page < final_page {
+    // ---- COMPLETION dimension ----
+    // Only the read -> unread transition is dangerous (unread -> read is always
+    // monotonic-safe), so regression detection is gated on `last_read == true`.
+    let mut final_complete = yac_read || stump_complete; // monotonic default
+    let mut unread_regress_stump = false; // a Stump un-complete clears YAC read
+    if let Some(prev) = prev {
+        if prev.yac_read {
+            let yac_unread = !yac_read
+                && yac_ts_newer(yac.last_time_opened, prev.yac_last_modified.as_deref());
+            let stump_unread = !stump_complete
+                && stump_ts_newer(stump_ts, prev.stump_last_modified.as_deref());
+            if yac_unread && !stump_unread {
+                // YAC intentionally unread; don't pull Stump's (sticky) completion
+                // back. Stump can't be un-completed, so it is left as-is.
+                final_complete = false;
+            } else if stump_unread && !yac_unread {
+                // Stump intentionally un-completed; clear YAC's read via the
+                // allow_regression pull below.
+                final_complete = false;
+                unread_regress_stump = true;
+            }
+        }
+    }
+
+    // ---- PUSH to Stump ----
+    // Send the converged page whenever Stump's page differs from it: covers Stump
+    // being behind (push UP) and a validated YAC re-read (push DOWN — final_page
+    // only drops below stump_page via the yac_back branch). Completion is only
+    // ever added, never removed.
+    let push_page = if stump_page != final_page {
         Some(final_page)
     } else {
         None
@@ -834,33 +1004,57 @@ pub fn compute_bidirectional_delta(
         None
     };
 
-    // Pull to YAC when YAC is behind on page and/or completion.
-    let pull_page = if yac.current_page < final_page {
-        Some(final_page)
+    // ---- PULL to YAC ----
+    // A Stump-side regression is the only thing that may LOWER YAC's page or
+    // CLEAR its read, and the only case allowed to bypass the C2 write-guard.
+    let stump_regressed = page_regress_stump || unread_regress_stump;
+    let pull = if stump_regressed {
+        // Write the EXACT converged state to YAC, but only when it differs.
+        let page = if yac_page != final_page {
+            Some(final_page)
+        } else {
+            None
+        };
+        if page.is_some() || final_complete != yac_read {
+            Some(PullAction {
+                page,
+                set_read: final_complete, // EXACT value in regression mode
+                allow_regression: true,
+                last_opened: None, // let the writer keep lastTimeOpened monotonic
+            })
+        } else {
+            None
+        }
     } else {
-        None
-    };
-    let set_read = final_complete && !yac.read;
-    // When pulling a Stump-side completion, record a completion time if Stump
-    // reports one. Completion lives in read_history now; stump_complete implies
-    // it is non-empty.
-    let last_opened = if set_read && stump_complete {
-        stump
-            .read_history
-            .first()
-            .and_then(|fs| fs.completed_at.as_ref())
-            .map(|_| now_epoch_secs())
-    } else {
-        None
-    };
-    let pull = if pull_page.is_some() || set_read {
-        Some(PullAction {
-            page: pull_page,
-            set_read,
-            last_opened,
-        })
-    } else {
-        None
+        // Normal monotonic pull (C2-safe): only ever RAISE page/read.
+        let pull_page = if yac_page < final_page {
+            Some(final_page)
+        } else {
+            None
+        };
+        let set_read = final_complete && !yac_read;
+        // When pulling a Stump-side completion, record a completion time if Stump
+        // reports one (completion lives in read_history; stump_complete => it is
+        // non-empty).
+        let last_opened = if set_read && stump_complete {
+            stump
+                .read_history
+                .first()
+                .and_then(|fs| fs.completed_at.as_ref())
+                .map(|_| now_epoch_secs())
+        } else {
+            None
+        };
+        if pull_page.is_some() || set_read {
+            Some(PullAction {
+                page: pull_page,
+                set_read,
+                allow_regression: false,
+                last_opened,
+            })
+        } else {
+            None
+        }
     };
 
     BidirectionalDelta {
@@ -870,6 +1064,8 @@ pub fn compute_bidirectional_delta(
         num_pages: yac.num_pages,
         push,
         pull,
+        final_page,
+        final_complete,
     }
 }
 
@@ -1017,6 +1213,10 @@ mod tests {
         assert_eq!(normalize_fs_path("/srv/comics///"), "/srv/comics");
         assert_eq!(normalize_fs_path("/"), "/");
         assert_eq!(normalize_fs_path(""), "");
+        // M5: runs of '/' anywhere collapse to a single separator.
+        assert_eq!(normalize_fs_path("/srv//comics"), "/srv/comics");
+        assert_eq!(normalize_fs_path("/srv///comics//"), "/srv/comics");
+        assert_eq!(normalize_fs_path("//"), "/");
     }
 
     #[test]
@@ -1195,7 +1395,7 @@ mod tests {
         let comic = make_comic(1, "test.cbz", 15, false);
         let media = make_stump_media("sm-1", "/comics/test.cbz", 5, false);
 
-        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb", None);
         let push = delta.push.expect("expected a push");
         assert_eq!(push.page, Some(15));
         assert!(!push.mark_complete);
@@ -1207,7 +1407,7 @@ mod tests {
         let comic = make_comic(1, "test.cbz", 5, false);
         let media = make_stump_media("sm-1", "/comics/test.cbz", 15, false);
 
-        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb", None);
         let pull = delta.pull.expect("expected a pull");
         assert_eq!(pull.page, Some(15));
         assert!(!pull.set_read);
@@ -1219,7 +1419,7 @@ mod tests {
         let comic = make_comic(1, "test.cbz", 10, false);
         let media = make_stump_media("sm-1", "/comics/test.cbz", 10, false);
 
-        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb", None);
         assert!(delta.push.is_none());
         assert!(delta.pull.is_none());
     }
@@ -1229,7 +1429,7 @@ mod tests {
         let comic = make_comic(1, "test.cbz", 20, true);
         let media = make_stump_media("sm-1", "/comics/test.cbz", 20, false);
 
-        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb", None);
         let push = delta.push.expect("expected a push");
         assert!(push.mark_complete);
         assert!(push.page.is_none());
@@ -1242,7 +1442,7 @@ mod tests {
         let comic = make_comic(1, "test.cbz", 20, false);
         let media = make_stump_media("sm-1", "/comics/test.cbz", 20, true);
 
-        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb", None);
         let pull = delta.pull.expect("expected a pull");
         assert!(pull.set_read);
         assert!(pull.page.is_none());
@@ -1255,7 +1455,7 @@ mod tests {
         let comic = make_comic(1, "test.cbz", 20, true);
         let media = make_stump_media("sm-1", "/comics/test.cbz", 20, true);
 
-        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb", None);
         assert!(delta.push.is_none());
         assert!(delta.pull.is_none());
     }
@@ -1265,7 +1465,7 @@ mod tests {
         let comic = make_comic(1, "test.cbz", 20, true);
         let media = make_stump_media("sm-1", "/comics/test.cbz", 10, false);
 
-        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb", None);
         let push = delta.push.expect("expected a push");
         assert_eq!(push.page, Some(20));
         assert!(push.mark_complete);
@@ -1277,7 +1477,7 @@ mod tests {
         let comic = make_comic(1, "test.cbz", 5, false);
         let media = make_stump_media("sm-1", "/comics/test.cbz", 18, true);
 
-        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb", None);
         let pull = delta.pull.expect("expected a pull");
         assert_eq!(pull.page, Some(18));
         assert!(pull.set_read);
@@ -1293,7 +1493,7 @@ mod tests {
         let comic = make_comic(1, "test.cbz", 18, false);
         let media = make_stump_media("sm-1", "/comics/test.cbz", 10, true);
 
-        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb", None);
 
         let push = delta.push.expect("expected a push (page to Stump)");
         assert_eq!(push.page, Some(18));
@@ -1332,7 +1532,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        write_yac_progress(path, 1, 15, 20, false, Some(1700000000)).unwrap();
+        write_yac_progress(path, 1, 15, 20, false, false, Some(1700000000)).unwrap();
 
         let conn = rusqlite::Connection::open(path).unwrap();
         let (page, read, opened, ts): (i32, i32, i32, i64) = conn
@@ -1370,7 +1570,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        write_yac_progress(path, 1, 20, 20, false, None).unwrap();
+        write_yac_progress(path, 1, 20, 20, false, false, None).unwrap();
 
         let conn = rusqlite::Connection::open(path).unwrap();
         let read: i32 = conn
@@ -1403,7 +1603,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let result = write_yac_progress(path, 999, 5, 20, false, None);
+        let result = write_yac_progress(path, 999, 5, 20, false, false, None);
         assert!(result.is_err());
     }
 
@@ -1456,7 +1656,7 @@ mod tests {
         let path = tmp.path().to_str().unwrap();
 
         // The pull action for this scenario is page=10, set_read=false.
-        write_yac_progress(path, 1, 10, 20, false, None).unwrap();
+        write_yac_progress(path, 1, 10, 20, false, false, None).unwrap();
 
         let (page, read, _opened) = read_row(path);
         assert_eq!(page, 10, "page should advance to Stump's page");
@@ -1471,7 +1671,7 @@ mod tests {
         // Stump's page catches up (it is already complete, so no re-mark).
         let comic = make_comic(1, "test.cbz", 20, false);
         let media = make_stump_media("sm-1", "/comics/test.cbz", 10, true);
-        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb", None);
         let pull = delta.pull.expect("case A: expected a pull");
         assert!(pull.set_read, "case A: YAC must become read");
         let push = delta.push.expect("case A: expected a page push");
@@ -1483,7 +1683,7 @@ mod tests {
         // while advancing its page.
         let comic = make_comic(1, "test.cbz", 5, true);
         let media = make_stump_media("sm-1", "/comics/test.cbz", 10, false);
-        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb");
+        let delta = compute_bidirectional_delta(&comic, &media, "/tmp/test.ydb", None);
         let push = delta.push.expect("case B: expected a push");
         assert!(push.mark_complete, "case B: Stump must be marked complete");
         let pull = delta.pull.expect("case B: expected a page pull");
@@ -1495,10 +1695,234 @@ mod tests {
         let tmp = ydb_with_comic(5, 20, 1, 1);
         let path = tmp.path().to_str().unwrap();
         let page = pull.page.unwrap_or(comic.current_page);
-        write_yac_progress(path, comic.comic_info_id, page, comic.num_pages, pull.set_read, pull.last_opened)
+        write_yac_progress(path, comic.comic_info_id, page, comic.num_pages, pull.set_read, pull.allow_regression, pull.last_opened)
             .unwrap();
         let (page, read, _opened) = read_row(path);
         assert_eq!(page, 10);
         assert_eq!(read, 1, "case B: YAC read flag preserved");
+    }
+
+    // ---- H6: hybrid re-read / unread conflict resolution ----
+
+    /// A prior CONVERGED `sync_state` baseline (page/read are the same on both
+    /// sides) plus the per-side source timestamps observed at that sync.
+    fn make_sync_state(
+        last_page: i32,
+        last_read: bool,
+        yac_ts: Option<&str>,
+        stump_ts: Option<&str>,
+    ) -> SyncState {
+        SyncState {
+            id: 1,
+            media_mapping_id: 1,
+            yac_current_page: last_page,
+            stump_current_page: last_page,
+            yac_read: last_read,
+            stump_complete: last_read,
+            yac_last_modified: yac_ts.map(str::to_string),
+            stump_last_modified: stump_ts.map(str::to_string),
+            last_synced_at: "2026-05-20T00:00:00Z".to_string(),
+        }
+    }
+
+    /// A YAC comic with an explicit `last_time_opened` (the H6 source clock).
+    fn comic_with_ts(page: i32, read: bool, last_time_opened: Option<i64>) -> ComicProgress {
+        ComicProgress {
+            comic_info_id: 1,
+            comic_id: 1001,
+            current_page: page,
+            num_pages: 20,
+            read,
+            has_been_opened: true,
+            last_time_opened,
+            hash: Some("h".into()),
+            relative_path: "test.cbz".into(),
+        }
+    }
+
+    /// A Stump media with an explicit `readProgress.updatedAt` (the H6 source
+    /// clock). `complete` adds a finished session to `read_history`.
+    fn stump_with_ts(page: i32, complete: bool, updated_at: Option<&str>) -> StumpMedia {
+        StumpMedia {
+            id: "sm-1".into(),
+            name: "test".into(),
+            pages: 20,
+            path: "/comics/test.cbz".into(),
+            read_progress: Some(ActiveReadingSession {
+                page: Some(page),
+                updated_at: updated_at.map(str::to_string),
+            }),
+            read_history: if complete {
+                vec![FinishedReadingSession {
+                    completed_at: Some("2024-01-01".into()),
+                }]
+            } else {
+                vec![]
+            },
+        }
+    }
+
+    /// YAC dropped below the last-synced page with a NEWER YAC timestamp while
+    /// Stump stayed put: YAC's re-read is honored — its lower page propagates to
+    /// Stump (push DOWN) and YAC keeps its position (no pull).
+    #[test]
+    fn test_reread_propagates_with_newer_same_side_ts() {
+        let prev = make_sync_state(15, false, Some("1700000000"), Some("2026-05-20T10:00:00Z"));
+        // YAC re-read back to page 3, opened more recently than the baseline.
+        let yac = comic_with_ts(3, false, Some(1700000999));
+        // Stump unchanged at page 15, same timestamp as the baseline (not newer).
+        let stump = stump_with_ts(15, false, Some("2026-05-20T10:00:00Z"));
+
+        let delta = compute_bidirectional_delta(&yac, &stump, "/tmp/test.ydb", Some(&prev));
+
+        assert_eq!(delta.final_page, 3, "the validated YAC re-read wins the page");
+        let push = delta.push.expect("Stump must be pulled DOWN to the re-read page");
+        assert_eq!(push.page, Some(3));
+        assert!(!push.mark_complete);
+        assert!(
+            delta.pull.is_none(),
+            "YAC already holds the re-read page; nothing to pull"
+        );
+    }
+
+    /// SAME lower page but an OLDER YAC timestamp: this is stale data, NOT a
+    /// re-read. Monotonic max must win and YAC is raised back up — no regression
+    /// (guards the C2 data-loss).
+    #[test]
+    fn test_stale_lower_page_does_not_regress() {
+        let prev = make_sync_state(15, false, Some("1700001000"), Some("2026-05-20T10:00:00Z"));
+        // YAC shows page 3 but was opened BEFORE the recorded baseline.
+        let yac = comic_with_ts(3, false, Some(1700000000));
+        let stump = stump_with_ts(15, false, Some("2026-05-20T10:00:00Z"));
+
+        let delta = compute_bidirectional_delta(&yac, &stump, "/tmp/test.ydb", Some(&prev));
+
+        assert_eq!(
+            delta.final_page, 15,
+            "stale lower page must NOT regress; monotonic max wins"
+        );
+        assert!(
+            delta.push.is_none(),
+            "Stump is at the converged page; nothing pushed"
+        );
+        let pull = delta.pull.expect("YAC is raised back up to the converged page");
+        assert_eq!(pull.page, Some(15));
+        assert!(
+            !pull.allow_regression,
+            "stale data never takes the regression write path (C2 guard intact)"
+        );
+    }
+
+    /// First sync (no baseline): regression is impossible, so even a YAC page
+    /// below Stump resolves by pure monotonic max.
+    #[test]
+    fn test_first_sync_no_regression() {
+        let yac = comic_with_ts(3, false, Some(1700000000));
+        let stump = stump_with_ts(15, false, Some("2026-05-20T10:00:00Z"));
+
+        let delta = compute_bidirectional_delta(&yac, &stump, "/tmp/test.ydb", None);
+
+        assert_eq!(delta.final_page, 15, "no baseline => monotonic max");
+        let pull = delta.pull.expect("YAC is raised to the higher page");
+        assert_eq!(pull.page, Some(15));
+        assert!(!pull.allow_regression, "no baseline => no regression possible");
+        assert!(delta.push.is_none());
+    }
+
+    /// Stump un-completed (newer Stump timestamp) while YAC stayed read: the
+    /// validated regression clears YAC's read via the allow_regression pull, and
+    /// the writer actually drops read=1 to 0.
+    #[test]
+    fn test_stump_unread_regression_clears_yac_read() {
+        let prev = make_sync_state(20, true, Some("1700000000"), Some("2026-05-20T10:00:00Z"));
+        // YAC still read, unchanged since the baseline.
+        let yac = comic_with_ts(20, true, Some(1700000000));
+        // Stump is no longer complete and was touched more recently.
+        let stump = stump_with_ts(20, false, Some("2026-05-21T10:00:00Z"));
+
+        let delta = compute_bidirectional_delta(&yac, &stump, "/tmp/test.ydb", Some(&prev));
+
+        assert!(
+            !delta.final_complete,
+            "a newer Stump un-complete clears the converged read"
+        );
+        let pull = delta
+            .pull
+            .clone()
+            .expect("YAC read must be cleared via a regression pull");
+        assert!(
+            pull.allow_regression,
+            "clearing read requires the regression write path"
+        );
+        assert!(!pull.set_read, "exact converged read value is false (cleared)");
+        assert!(delta.push.is_none(), "Stump cannot be (un)completed by a push");
+
+        // The writer actually clears read=1 in this mode.
+        let tmp = ydb_with_comic(20, 20, 1, 1);
+        let path = tmp.path().to_str().unwrap();
+        let page = pull.page.unwrap_or(yac.current_page);
+        write_yac_progress(
+            path,
+            yac.comic_info_id,
+            page,
+            yac.num_pages,
+            pull.set_read,
+            pull.allow_regression,
+            pull.last_opened,
+        )
+        .unwrap();
+        let (_page, read, _opened) = read_row(path);
+        assert_eq!(read, 0, "validated Stump un-complete clears YAC read");
+    }
+
+    /// Writer-level contrast: `allow_regression` lets the page drop; the default
+    /// monotonic write keeps the higher existing page (C2).
+    #[test]
+    fn test_write_yac_progress_allow_regression_lowers_page() {
+        let tmp = ydb_with_comic(15, 20, 0, 1);
+        let path = tmp.path().to_str().unwrap();
+        write_yac_progress(path, 1, 3, 20, false, true, Some(1700000500)).unwrap();
+        let (page, read, _opened) = read_row(path);
+        assert_eq!(page, 3, "allow_regression lets currentPage drop");
+        assert_eq!(read, 0);
+
+        let tmp2 = ydb_with_comic(15, 20, 0, 1);
+        let path2 = tmp2.path().to_str().unwrap();
+        write_yac_progress(path2, 1, 3, 20, false, false, Some(1700000500)).unwrap();
+        let (page2, _read2, _opened2) = read_row(path2);
+        assert_eq!(page2, 15, "default monotonic write keeps the higher page (C2)");
+    }
+
+    // ---- M5: path-boundary matching ----
+
+    /// `/srv/comics` must NOT swallow the sibling directory `/srv/comics-extra`:
+    /// a raw string prefix would false-match it.
+    #[test]
+    fn test_library_prefix_boundary() {
+        let yac = vec![make_comic(1, "x.cbz", 5, false)];
+
+        let sibling = vec![make_stump_media("sm-1", "/srv/comics-extra/x.cbz", 3, false)];
+        let matches = match_comics(&yac, &sibling, "/srv/comics");
+        assert!(
+            matches.is_empty(),
+            "a sibling dir sharing a name prefix must not match across the boundary"
+        );
+
+        // The genuine child still matches.
+        let child = vec![make_stump_media("sm-2", "/srv/comics/x.cbz", 3, false)];
+        let matches = match_comics(&yac, &child, "/srv/comics");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].1.id, "sm-2");
+    }
+
+    /// Redundant '/' runs in either the library path or the media path normalize
+    /// away so matching still succeeds.
+    #[test]
+    fn test_match_comics_collapses_double_slash() {
+        let yac = vec![make_comic(1, "Marvel/001.cbz", 5, false)];
+        let stump = vec![make_stump_media("sm-1", "/srv/comics//Marvel/001.cbz", 3, false)];
+        let matches = match_comics(&yac, &stump, "/srv//comics/");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].1.id, "sm-1");
     }
 }

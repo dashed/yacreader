@@ -7,6 +7,13 @@ use crate::types::{StumpLibrary, StumpMedia, SyncError};
 pub struct StumpClient {
     client: reqwest::Client,
     base_url: String,
+    // Stump identifies the acting user via the API key (sent as the Bearer
+    // token), so `readProgress`/`readHistory` are auto-scoped to that user
+    // server-side (post-C3). This copy is therefore never read for request
+    // scoping; it is retained — threaded through from `config.user_id` — only
+    // for logging / potential future use. Kept (rather than dropped) to avoid
+    // churning the `new` signature and every caller outside this file; hence
+    // `dead_code` is allowed for the field (audit M6).
     #[allow(dead_code)]
     user_id: String,
 }
@@ -282,11 +289,6 @@ impl StumpClient {
         }
 
         Err(last_err)
-    }
-
-    #[cfg(test)]
-    pub fn user_id(&self) -> &str {
-        &self.user_id
     }
 }
 
